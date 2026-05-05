@@ -632,10 +632,21 @@ REPO_NAME  = os.environ.get("REPO_NAME", "")
 repo_pr_url_base = (f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/"
                     if REPO_OWNER and REPO_NAME else "")
 
+# Standouts cards — comma-separated list of dimension codes, in render order.
+# See render_html.py STANDOUT_DEFS for the full set. Default keeps the
+# pre-config behavior so nothing breaks for adopters who don't set this.
+DEFAULT_STANDOUTS = "top_impact,top_reviewer,highest_output,most_prs"
+standouts_config = [
+    s.strip()
+    for s in os.environ.get("STANDOUTS", DEFAULT_STANDOUTS).split(",")
+    if s.strip()
+]
+
 data = {
     "generated_at": NOW.isoformat(),
     "repo_first_commit": REPO_FIRST_COMMIT,
     "repo_pr_url_base": repo_pr_url_base,
+    "standouts_config": standouts_config,
     "weeks": weeks_sorted,
     "totals": totals,
     "contributors": contributors,

@@ -602,33 +602,82 @@ function renderPackageTable() {
   });
 }
 
+// Registry of available standout cards. Each entry picks one row from the
+// current slice's data and renders one card. `requires` gates a card on a
+// feature flag.
+const STANDOUT_DEFS = {
+  top_impact: {
+    label: "Top Impact",
+    pick:  rows => rows.slice().sort((a,b) => (b.weighted_lines||0) - (a.weighted_lines||0))[0],
+    body:  r => `${fmt(r.weighted_lines)} hotspot-weighted lines across ${r.prs} PRs. Owns ${r.top_files && r.top_files[0] ? r.top_files[0][0] : 'core areas'}.`,
+  },
+  top_reviewer: {
+    label: "Top Reviewer",
+    pick:  rows => rows.slice().sort((a,b) => (b.reviews||0) - (a.reviews||0))[0],
+    body:  r => `${r.reviews} reviews on others' PRs — quality gate for the team.`,
+  },
+  highest_output: {
+    label: "Highest Output",
+    pick:  rows => rows.slice().sort((a,b) => (b.commits||0) - (a.commits||0))[0],
+    body:  r => `${r.commits} commits, ${r.prs} PRs shipped (note: merge-strategy biased — see C/PR).`,
+  },
+  most_prs: {
+    label: "Most PRs Shipped",
+    pick:  rows => rows.slice().sort((a,b) => (b.prs||0) - (a.prs||0))[0],
+    body:  r => `${r.prs} merged PRs (credit-weighted).`,
+  },
+  most_prs_opened: {
+    label: "Most PRs Opened",
+    pick:  rows => rows.slice().sort((a,b) => (b.prs_raw||0) - (a.prs_raw||0))[0],
+    body:  r => `${r.prs_raw} merged PRs by raw count.`,
+  },
+  highest_volume: {
+    label: "Highest Volume",
+    pick:  rows => rows.slice().sort((a,b) => (b.add||0) - (a.add||0))[0],
+    body:  r => `${fmt(r.add)} lines added.`,
+  },
+  biggest_cleanup: {
+    label: "Biggest Cleanup",
+    pick:  rows => rows.slice().sort((a,b) => (b.del||0) - (a.del||0))[0],
+    body:  r => `${fmt(r.del)} lines removed — the unsung refactor work.`,
+  },
+  broadest_reach: {
+    label: "Broadest Reach",
+    pick:  rows => rows.slice().sort((a,b) => (b.files||0) - (a.files||0))[0],
+    body:  r => `Touched ${r.files} distinct files in this slice.`,
+  },
+  most_iterated: {
+    label: "Most Iterated On",
+    pick:  rows => rows.slice().sort((a,b) => (b.iteration_count||0) - (a.iteration_count||0))[0],
+    body:  r => `${r.iteration_count} of their PRs were later touched by another author's fix.`,
+    requires: "iteration",
+  },
+  cleanest_shipper: {
+    label: "Cleanest Shipper",
+    pick:  rows => rows.slice()
+                       .filter(r => r.iteration_rate != null && r.prs >= 5)
+                       .sort((a,b) => (a.iteration_rate||0) - (b.iteration_rate||0))[0],
+    body:  r => `${r.iteration_rate}% iteration rate — lowest among contributors with ≥5 PRs.`,
+    requires: "iteration",
+  },
+};
+
 function renderStandouts() {
-  // Build standouts from current-slice data
   const rows = getRows();
-  const max = (key) => rows.slice().sort((a,b) => (b[key]||0) - (a[key]||0))[0];
+  const config = DATA.standouts_config && DATA.standouts_config.length
+    ? DATA.standouts_config
+    : ["top_impact","top_reviewer","highest_output","most_prs"];
+  const seen  = new Set();
   const cards = [];
-  const topW = max("weighted_lines");
-  const topC = max("commits");
-  const topR = max("reviews");
-  const topP = max("prs");
-
-  cards.push({
-    name: topW.name, tag: "Top Impact",
-    body: `${fmt(topW.weighted_lines)} hotspot-weighted lines across ${topW.prs} PRs. Owns ${topW.top_files[0] ? topW.top_files[0][0] : 'core areas'}.`
-  });
-  if (topR.name !== topW.name) cards.push({
-    name: topR.name, tag: "Top Reviewer",
-    body: `${topR.reviews} reviews on others' PRs — quality gate for the team.`
-  });
-  if (topC.name !== topW.name && topC.name !== topR.name) cards.push({
-    name: topC.name, tag: "Highest Output",
-    body: `${topC.commits} commits, ${topC.prs} PRs shipped.`
-  });
-  if (topP.name !== topW.name && topP.name !== topC.name && topP.name !== topR.name) cards.push({
-    name: topP.name, tag: "Most PRs Shipped",
-    body: `${topP.prs} merged PRs.`
-  });
-
+  for (const code of config) {
+    const def = STANDOUT_DEFS[code];
+    if (!def) continue;
+    if (def.requires === "iteration" && !DATA.show_iteration) continue;
+    const winner = def.pick(rows);
+    if (!winner || seen.has(winner.name)) continue;
+    seen.add(winner.name);
+    cards.push({ name: winner.name, tag: def.label, body: def.body(winner) });
+  }
   $("#standouts").innerHTML = cards.map(c => `
     <div class="top-card">
       <div class="top-card-name">${escape(c.name)}</div>
