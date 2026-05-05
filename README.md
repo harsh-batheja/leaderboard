@@ -81,9 +81,9 @@ leaderboard number.
 Set `SIMILARITY_CREDIT_DELTA=1` in your config to shift PR credit from the merged
 author to the closed author for each flagged pair (where merge came after close).
 Shift = file-set Jaccard, capped at `SIMILARITY_DELTA_CAP` (default 0.4) per
-merged PR. Rework attribution does not shift. Use sparingly — propagates the
-flag's false-positive rate into leaderboard numbers. The page shows a badge in
-the header when this is active.
+merged PR. Iteration attribution does not shift. Use sparingly — propagates
+the flag's false-positive rate into leaderboard numbers. The page shows a
+badge in the header when this is active.
 
 ## What's measured
 

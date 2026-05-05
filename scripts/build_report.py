@@ -129,14 +129,20 @@ with open(DATA_DIR / "prs.jsonl") as f:
     for line in f:
         all_prs.append(json.loads(line))
 
-# Detect "rework": PR numbers that were later reverted by another merged PR.
-# Title patterns:  `Revert "..." (#N)`  or  `revert: ... (PR #N)` or `revert: ... PR #N`
-# Body fallback:   `Reverts #N`  or  `Reverts owner/repo#N`
+# Detect "iteration": a PR is iterated-on if either
+#   (a) a later merged Revert PR points at it, OR
+#   (b) a later merged "fix"-titled PR by a different author touches ≥ N of its
+#       files within the iteration window (default 30 days).
 REVERT_TITLE_RE = re.compile(r'^\s*revert\b', re.IGNORECASE)
 TITLE_HASH_RE   = re.compile(r'\(#(\d+)\)')
 TITLE_PR_RE     = re.compile(r'\bPR\s*#(\d+)', re.IGNORECASE)
 BODY_REVERTS_RE = re.compile(r'(?im)\breverts?\s+(?:[\w.-]+/[\w.-]+)?#(\d+)')
+FIX_TITLE_RE    = re.compile(r'^\s*fix\b', re.IGNORECASE)
 
+ITERATION_WINDOW_DAYS = int(os.environ.get("ITERATION_WINDOW_DAYS", "30"))
+ITERATION_MIN_SHARED  = int(os.environ.get("ITERATION_MIN_SHARED",  "2"))
+
+# (a) Strict reverts via title/body cross-reference
 reverted_pr_numbers: set[int] = set()
 for pr in all_prs:
     title = pr.get("title") or ""
@@ -152,12 +158,56 @@ for pr in all_prs:
     if target and target != pr["number"]:
         reverted_pr_numbers.add(target)
 
-print(f"Rework signal: {len(reverted_pr_numbers)} PRs were later reverted",
+# (b) Fix-followed: load file lists from pr_files.jsonl (already pulled for
+# the similarity scan) and walk merged PRs in time order.
+files_by_pr: dict[int, set] = {}
+try:
+    with open(DATA_DIR / "pr_files.jsonl") as f:
+        for line in f:
+            p = json.loads(line)
+            files_by_pr[p["number"]] = set(
+                n["path"] for n in p.get("files", {}).get("nodes", [])
+                if n.get("path")
+            )
+except FileNotFoundError:
+    pass
+
+merged_sorted = sorted(
+    [pr for pr in all_prs if pr.get("mergedAt")],
+    key=lambda pr: pr["mergedAt"],
+)
+fix_followed_pr_numbers: set[int] = set()
+for i, p in enumerate(merged_sorted):
+    p_num    = p["number"]
+    p_author = (p.get("author") or {}).get("login")
+    if not p_author or p_author in BOTS:
+        continue
+    p_files  = files_by_pr.get(p_num, set())
+    if len(p_files) < ITERATION_MIN_SHARED:
+        continue
+    p_dt = datetime.fromisoformat(p["mergedAt"].replace("Z", "+00:00"))
+    for q in merged_sorted[i + 1:]:
+        q_dt = datetime.fromisoformat(q["mergedAt"].replace("Z", "+00:00"))
+        if (q_dt - p_dt).days > ITERATION_WINDOW_DAYS:
+            break
+        q_author = (q.get("author") or {}).get("login")
+        if not q_author or q_author == p_author or q_author in BOTS:
+            continue
+        if not FIX_TITLE_RE.search(q.get("title") or ""):
+            continue
+        q_files = files_by_pr.get(q["number"], set())
+        if len(p_files & q_files) >= ITERATION_MIN_SHARED:
+            fix_followed_pr_numbers.add(p_num)
+            break
+
+iterated_pr_numbers = reverted_pr_numbers | fix_followed_pr_numbers
+print(f"Iteration signal: {len(iterated_pr_numbers)} PRs iterated on "
+      f"({len(reverted_pr_numbers)} reverts + {len(fix_followed_pr_numbers)} fix-followed)",
       file=sys.stderr)
 
 def empty_pr_stats():
     return {"prs": 0, "pr_credit": 0.0,
-            "prs_reverted": 0, "pr_credit_reverted": 0.0,
+            "prs_iterated": 0, "pr_credit_iterated": 0.0,
             "reviews": 0,
             "ttm_seconds": 0, "ttm_count": 0,
             "pr_commit_total": 0, "pr_count_for_commits": 0}
@@ -215,7 +265,7 @@ for pr in all_prs:
     created_at = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
     ttm_seconds = (merged_at - created_at).total_seconds()
     commits_count = pr.get("commits", {}).get("totalCount", 0)
-    was_reverted = pr["number"] in reverted_pr_numbers
+    was_iterated = pr["number"] in iterated_pr_numbers
 
     active_slices = []
     for s in SLICES:
@@ -225,8 +275,8 @@ for pr in all_prs:
         # Raw count (PR opener) — kept for ttm/legacy
         opener = pr_slices[s][pr_author_login]
         opener["prs"] += 1
-        if was_reverted:
-            opener["prs_reverted"] += 1
+        if was_iterated:
+            opener["prs_iterated"] += 1
         opener["ttm_seconds"] += ttm_seconds
         opener["ttm_count"] += 1
         if commits_count:
@@ -236,8 +286,8 @@ for pr in all_prs:
         for u, share in shares.items():
             stats = pr_slices[s][u]
             stats["pr_credit"] += share
-            if was_reverted:
-                stats["pr_credit_reverted"] += share
+            if was_iterated:
+                stats["pr_credit_iterated"] += share
 
     if active_slices:
         pr_credit_log[pr["number"]] = {"shares": dict(shares), "slices": active_slices}
@@ -256,8 +306,8 @@ for pr in all_prs:
 
 print(f"Parsed PR data: {len(pr_slices['all'])} active gh logins all-time", file=sys.stderr)
 
-# Minimum PR sample for the rework rate to be displayed (else None).
-REWORK_MIN_PRS = 5
+# Minimum PR sample for the iteration rate to be displayed (else None).
+ITERATION_MIN_PRS = 5
 
 # ─── 3. Compute hotspot weights ────────────────────────────────────────────────
 
@@ -403,8 +453,8 @@ print(f"Similarity flags: {len(similarity_pairs)}", file=sys.stderr)
 # Off by default. When enabled, for each flagged pair where the merged PR came
 # AFTER the closed PR, shift `jaccard × per-author share` of the merged PR's
 # credit from each merged-PR contributor to the closed-PR author. Total shift
-# per merged PR is capped at SIMILARITY_DELTA_CAP. Rework attribution does NOT
-# shift — bugs in the merged version stay with whoever wrote them.
+# per merged PR is capped at SIMILARITY_DELTA_CAP. Iteration attribution does
+# NOT shift — fixes follow whoever wrote the merged code.
 
 CREDIT_DELTA_ENABLED = os.environ.get("SIMILARITY_CREDIT_DELTA", "0") == "1"
 CREDIT_DELTA_CAP     = float(os.environ.get("SIMILARITY_DELTA_CAP", "0.4"))
@@ -481,8 +531,8 @@ for name in all_names:
     for s in SLICES:
         gd = slices_data[s].get(name, empty_stats())
         pd = pr_slices[s].get(gh, empty_pr_stats())
-        rework_rate = (round(100 * pd["pr_credit_reverted"] / pd["pr_credit"], 1)
-                       if pd["pr_credit"] >= REWORK_MIN_PRS else None)
+        iteration_rate = (round(100 * pd["pr_credit_iterated"] / pd["pr_credit"], 1)
+                          if pd["pr_credit"] >= ITERATION_MIN_PRS else None)
         record["slices"][s] = {
             "commits": gd["commits"],
             "add": gd["add"],
@@ -492,8 +542,8 @@ for name in all_names:
             "prs": round(pd["pr_credit"], 1),       # credit-weighted: split by commit-author share
             "prs_raw": pd["prs"],                    # # of PRs opened by this user
             "reviews": pd["reviews"],
-            "rework_count": round(pd["pr_credit_reverted"], 1),
-            "rework_rate": rework_rate,
+            "iteration_count": round(pd["pr_credit_iterated"], 1),
+            "iteration_rate": iteration_rate,
         }
     contributors[name] = record
 

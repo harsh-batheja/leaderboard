@@ -185,7 +185,7 @@ HTML = r"""<!doctype html>
     <th></th>
     <th data-sort="reviews">Reviews</th>
     <th></th>
-    <th data-sort="rework_rate">Rework</th>
+    <th data-sort="iteration_rate">Iteration</th>
     <th data-sort="files">Files</th>
     <th>Activity (per week)</th>
   </tr></thead>
@@ -274,22 +274,36 @@ HTML = r"""<!doctype html>
   a fraction of each merged PR's credit is shifted to the author of any
   earlier closed PR it overlaps with (see "Possible re-implementation pairs"
   above). The shift equals the file-set Jaccard, capped at
-  <code>SIMILARITY_DELTA_CAP</code> (default 0.4) per merged PR. Rework
-  attribution does <em>not</em> shift — bugs in the merged version stay with
-  whoever wrote them.</p>
+  <code>SIMILARITY_DELTA_CAP</code> (default 0.4) per merged PR. Iteration
+  attribution does <em>not</em> shift — fixes stay with whoever wrote the
+  merged code.</p>
   <div class="callout">
     Auto-shift propagates the false-positive risk of similarity flagging into
     leaderboard numbers. Use sparingly. The badge in the header indicates
     whether deltas were applied for the current page.
   </div>
 
-  <h3>Rework rate</h3>
-  <p>Counts merged PRs that were later reverted by another merged PR. Detection:
-  a subsequent merged PR with title starting <code>Revert</code>/<code>revert</code>
-  that references the original PR number in its title or body. The rate uses
-  credit-weighted PR counts (see above) on both sides — a PR with shared
-  authorship splits the "blame" the same way it splits the credit. Rates
-  are hidden for contributors with fewer than 5 (credit-weighted) PRs.</p>
+  <h3>Iteration rate</h3>
+  <p>Counts merged PRs that <em>another author</em> later iterated on. A PR is
+  iterated-on if either:</p>
+  <ul>
+    <li>A later merged PR titled <code>Revert</code>/<code>revert</code> points
+    at it (an explicit revert), <strong>or</strong></li>
+    <li>A later merged PR titled <code>fix:</code> by a different author,
+    within 30 days, touches at least 2 of its files.</li>
+  </ul>
+  <p>The rate uses credit-weighted PR counts on both sides (a PR with shared
+  authorship splits the iteration the same way as the credit). Rates are
+  hidden for contributors with fewer than 5 credit-weighted PRs.</p>
+  <div class="callout">
+    <strong>This is not a defect rate.</strong> It includes legitimate
+    iteration: hot files get follow-up fixes regardless of whether the
+    original PR had bugs. People working on <code>Dashboard.tsx</code> or
+    <code>session-manager.ts</code> will see higher iteration rates than
+    people working on rarely-edited code, even at identical skill. Read
+    this column as "how often does the code area you ship in get touched
+    again soon," not "how often is your work wrong."
+  </div>
   <div class="callout">
     What this is <strong>not</strong>: a measure of code quality. Known biases:
     hot-file work has higher revert rates regardless of skill; recent PRs haven't
@@ -372,8 +386,8 @@ function getRows() {
       net: s.net,
       prs: s.prs,
       reviews: s.reviews,
-      rework_count: s.rework_count ?? 0,
-      rework_rate: s.rework_rate,           // null when prs < threshold
+      iteration_count: s.iteration_count ?? 0,
+      iteration_rate:  s.iteration_rate,    // null when prs < threshold
       files: s.files,
       packages: r.packages,
       top_files: r.top_files,
@@ -467,9 +481,9 @@ function renderTable() {
       ? `<a href="https://github.com/${escape(r.ghLogin)}" target="_blank" rel="noopener">${escape(r.name)}</a>`
       : escape(r.name);
     const netClass = r.net >= 0 ? "bar-net-pos" : "bar-net-neg";
-    const reworkCell = (r.rework_rate == null)
+    const iterCell = (r.iteration_rate == null)
       ? `<span class="muted-num">—</span>`
-      : `${r.rework_rate}%<span class="muted-num"> ${r.rework_count}/${r.prs}</span>`;
+      : `${r.iteration_rate}%<span class="muted-num"> ${r.iteration_count}/${r.prs}</span>`;
     tr.innerHTML = `
       <td class="name">${ghLink} <button class="expand-btn" data-name="${escape(r.name)}">▸</button></td>
       <td class="num">${fmt(r.weighted_lines)}</td>
@@ -484,7 +498,7 @@ function renderTable() {
       <td class="bar-cell">${bar(r.prs, maxP, "bar-p")}</td>
       <td class="num">${r.reviews}</td>
       <td class="bar-cell">${bar(r.reviews, maxR, "bar-r")}</td>
-      <td class="num">${reworkCell}</td>
+      <td class="num">${iterCell}</td>
       <td class="num muted-num">${r.files}</td>
       <td>${sparklineSVG(r.sparkline)}</td>
     `;
