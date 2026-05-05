@@ -1,0 +1,13 @@
+out/
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+
+# Configs are private (paths, deploy targets). Only example.env is tracked.
+config/*.env
+!config/example.env
+
+# Identity / bot lists are project-specific data — keep them out of the public repo.
+config/*.json
+
