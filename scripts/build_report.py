@@ -123,55 +123,91 @@ print(f"Parsed git data: {len(slices_data['all'])} authors all-time, "
 
 # ─── 2. Parse PR data + reviews ────────────────────────────────────────────────
 
-# Per slice: gh_login -> {prs, reviews, ttm_total_seconds, ttm_count, commits_in_prs_total, prs_with_commits}
+# Load all PRs into memory (small — typically a few hundred to low thousands of rows).
+all_prs = []
+with open(DATA_DIR / "prs.jsonl") as f:
+    for line in f:
+        all_prs.append(json.loads(line))
+
+# Detect "rework": PR numbers that were later reverted by another merged PR.
+# Title patterns:  `Revert "..." (#N)`  or  `revert: ... (PR #N)` or `revert: ... PR #N`
+# Body fallback:   `Reverts #N`  or  `Reverts owner/repo#N`
+REVERT_TITLE_RE = re.compile(r'^\s*revert\b', re.IGNORECASE)
+TITLE_HASH_RE   = re.compile(r'\(#(\d+)\)')
+TITLE_PR_RE     = re.compile(r'\bPR\s*#(\d+)', re.IGNORECASE)
+BODY_REVERTS_RE = re.compile(r'(?im)\breverts?\s+(?:[\w.-]+/[\w.-]+)?#(\d+)')
+
+reverted_pr_numbers: set[int] = set()
+for pr in all_prs:
+    title = pr.get("title") or ""
+    body  = pr.get("body")  or ""
+    if not REVERT_TITLE_RE.search(title):
+        continue
+    target = None
+    for rx in (TITLE_HASH_RE, TITLE_PR_RE, BODY_REVERTS_RE):
+        m = rx.search(title) or rx.search(body)
+        if m:
+            target = int(m.group(1))
+            break
+    if target and target != pr["number"]:
+        reverted_pr_numbers.add(target)
+
+print(f"Rework signal: {len(reverted_pr_numbers)} PRs were later reverted",
+      file=sys.stderr)
+
 def empty_pr_stats():
-    return {"prs": 0, "reviews": 0, "ttm_seconds": 0, "ttm_count": 0,
+    return {"prs": 0, "prs_reverted": 0, "reviews": 0,
+            "ttm_seconds": 0, "ttm_count": 0,
             "pr_commit_total": 0, "pr_count_for_commits": 0}
 
 pr_slices = {s: defaultdict(empty_pr_stats) for s in SLICES}
 
-with open(DATA_DIR / "prs.jsonl") as f:
-    for line in f:
-        pr = json.loads(line)
-        if not pr.get("author"):
-            continue
-        author_login = pr["author"]["login"]
-        if author_login in BOTS:
-            continue
-        # Re-attribute trigger-bot PRs to the human who filed the originating issue.
-        if TRIGGER_BOT_LOGIN and author_login == TRIGGER_BOT_LOGIN:
-            trigger = TRIGGER_BOT_TRIGGERS.get(pr["number"])
-            if trigger:
-                author_login = trigger
-        merged_at = datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00"))
-        created_at = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
-        ttm_seconds = (merged_at - created_at).total_seconds()
-        commits_count = pr.get("commits", {}).get("totalCount", 0)
+for pr in all_prs:
+    if not pr.get("author"):
+        continue
+    author_login = pr["author"]["login"]
+    if author_login in BOTS:
+        continue
+    # Re-attribute trigger-bot PRs to the human who filed the originating issue.
+    if TRIGGER_BOT_LOGIN and author_login == TRIGGER_BOT_LOGIN:
+        trigger = TRIGGER_BOT_TRIGGERS.get(pr["number"])
+        if trigger:
+            author_login = trigger
+    merged_at = datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00"))
+    created_at = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
+    ttm_seconds = (merged_at - created_at).total_seconds()
+    commits_count = pr.get("commits", {}).get("totalCount", 0)
+    was_reverted = pr["number"] in reverted_pr_numbers
 
+    for s in SLICES:
+        if not in_slice(merged_at, s):
+            continue
+        stats = pr_slices[s][author_login]
+        stats["prs"] += 1
+        if was_reverted:
+            stats["prs_reverted"] += 1
+        stats["ttm_seconds"] += ttm_seconds
+        stats["ttm_count"] += 1
+        if commits_count:
+            stats["pr_commit_total"] += commits_count
+            stats["pr_count_for_commits"] += 1
+
+    # Reviews
+    for review in pr.get("reviews", {}).get("nodes", []):
+        if not review.get("author"):
+            continue
+        r_login = review["author"]["login"]
+        if r_login in BOTS or r_login == author_login:  # don't count self-reviews
+            continue
+        r_ts = datetime.fromisoformat(review["submittedAt"].replace("Z", "+00:00")) if review.get("submittedAt") else merged_at
         for s in SLICES:
-            if not in_slice(merged_at, s):
-                continue
-            stats = pr_slices[s][author_login]
-            stats["prs"] += 1
-            stats["ttm_seconds"] += ttm_seconds
-            stats["ttm_count"] += 1
-            if commits_count:
-                stats["pr_commit_total"] += commits_count
-                stats["pr_count_for_commits"] += 1
-
-        # Reviews
-        for review in pr.get("reviews", {}).get("nodes", []):
-            if not review.get("author"):
-                continue
-            r_login = review["author"]["login"]
-            if r_login in BOTS or r_login == author_login:  # don't count self-reviews
-                continue
-            r_ts = datetime.fromisoformat(review["submittedAt"].replace("Z", "+00:00")) if review.get("submittedAt") else merged_at
-            for s in SLICES:
-                if in_slice(r_ts, s):
-                    pr_slices[s][r_login]["reviews"] += 1
+            if in_slice(r_ts, s):
+                pr_slices[s][r_login]["reviews"] += 1
 
 print(f"Parsed PR data: {len(pr_slices['all'])} active gh logins all-time", file=sys.stderr)
+
+# Minimum PR sample for the rework rate to be displayed (else None).
+REWORK_MIN_PRS = 5
 
 # ─── 3. Compute hotspot weights ────────────────────────────────────────────────
 
@@ -258,6 +294,8 @@ for name in all_names:
         gd = slices_data[s].get(name, empty_stats())
         # PR data — match by gh login (handle the same login mapping to multiple names)
         pd = pr_slices[s].get(gh, empty_pr_stats())
+        rework_rate = (round(100 * pd["prs_reverted"] / pd["prs"], 1)
+                       if pd["prs"] >= REWORK_MIN_PRS else None)
         record["slices"][s] = {
             "commits": gd["commits"],
             "add": gd["add"],
@@ -266,6 +304,8 @@ for name in all_names:
             "files": gd["files_touched"] if isinstance(gd["files_touched"], int) else len(gd["files_touched"]),
             "prs": pd["prs"],
             "reviews": pd["reviews"],
+            "rework_count": pd["prs_reverted"],
+            "rework_rate": rework_rate,
         }
     contributors[name] = record
 

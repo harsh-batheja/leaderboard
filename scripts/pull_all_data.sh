@@ -38,6 +38,8 @@ query(\$cursor: String) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number
+        title
+        body
         author { login }
         createdAt
         mergedAt

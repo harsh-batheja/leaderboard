@@ -182,6 +182,7 @@ HTML = r"""<!doctype html>
     <th></th>
     <th data-sort="reviews">Reviews</th>
     <th></th>
+    <th data-sort="rework_rate">Rework</th>
     <th data-sort="files">Files</th>
     <th>Activity (per week)</th>
   </tr></thead>
@@ -230,6 +231,19 @@ HTML = r"""<!doctype html>
   reviews on other people's PRs, excluding self-comments and the bots/AI-reviewers configured
   in the bots list. Senior contributors often shift toward review and away from authoring;
   without this column, that work is invisible.</p>
+
+  <h3>Rework rate</h3>
+  <p>Counts merged PRs that were later reverted by another merged PR. Detection:
+  a subsequent merged PR with title starting <code>Revert</code>/<code>revert</code>
+  that references the original PR number in its title or body. Rates are hidden
+  for contributors with fewer than 5 PRs in the slice — too noisy below that.</p>
+  <div class="callout">
+    What this is <strong>not</strong>: a measure of code quality. Known biases:
+    hot-file work has higher revert rates regardless of skill; recent PRs haven't
+    had time to develop regressions yet; reverts also happen for product reasons
+    (perf tuning, merge conflicts, plan changes), not just bugs. Read this column
+    alongside the others, not in isolation.
+  </div>
 
   <h3>Per-author identity dedup via <code>.mailmap</code></h3>
   <p>Author identity is normalised through <code>git log --use-mailmap</code>, which reads a
@@ -298,6 +312,8 @@ function getRows() {
       net: s.net,
       prs: s.prs,
       reviews: s.reviews,
+      rework_count: s.rework_count ?? 0,
+      rework_rate: s.rework_rate,           // null when prs < threshold
       files: s.files,
       packages: r.packages,
       top_files: r.top_files,
@@ -391,6 +407,9 @@ function renderTable() {
       ? `<a href="https://github.com/${escape(r.ghLogin)}" target="_blank" rel="noopener">${escape(r.name)}</a>`
       : escape(r.name);
     const netClass = r.net >= 0 ? "bar-net-pos" : "bar-net-neg";
+    const reworkCell = (r.rework_rate == null)
+      ? `<span class="muted-num">—</span>`
+      : `${r.rework_rate}%<span class="muted-num"> ${r.rework_count}/${r.prs}</span>`;
     tr.innerHTML = `
       <td class="name">${ghLink} <button class="expand-btn" data-name="${escape(r.name)}">▸</button></td>
       <td class="num">${fmt(r.weighted_lines)}</td>
@@ -405,6 +424,7 @@ function renderTable() {
       <td class="bar-cell">${bar(r.prs, maxP, "bar-p")}</td>
       <td class="num">${r.reviews}</td>
       <td class="bar-cell">${bar(r.reviews, maxR, "bar-r")}</td>
+      <td class="num">${reworkCell}</td>
       <td class="num muted-num">${r.files}</td>
       <td>${sparklineSVG(r.sparkline)}</td>
     `;
@@ -413,7 +433,7 @@ function renderTable() {
     // Detail row (collapsible)
     const detail = document.createElement("tr");
     detail.style.display = "none";
-    detail.innerHTML = `<td colspan="15" style="padding: 0;"><div style="padding: 12px 32px;">${detailHTML(r)}</div></td>`;
+    detail.innerHTML = `<td colspan="16" style="padding: 0;"><div style="padding: 12px 32px;">${detailHTML(r)}</div></td>`;
     body.appendChild(detail);
   });
 
