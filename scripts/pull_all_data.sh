@@ -34,7 +34,7 @@ git log --no-merges --use-mailmap --pretty=tformat:'COMMIT	%aN' --numstat \
 cat > "$DATA_DIR/query.graphql" <<GQL
 query(\$cursor: String) {
   repository(owner: "$REPO_OWNER", name: "$REPO_NAME") {
-    pullRequests(first: 50, after: \$cursor, states: MERGED, orderBy: {field: CREATED_AT, direction: DESC}) {
+    pullRequests(first: 25, after: \$cursor, states: MERGED, orderBy: {field: CREATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number
@@ -45,7 +45,20 @@ query(\$cursor: String) {
         mergedAt
         additions
         deletions
-        commits { totalCount }
+        commits(first: 50) {
+          totalCount
+          nodes {
+            commit {
+              oid
+              additions
+              author {
+                user { login }
+                name
+                email
+              }
+            }
+          }
+        }
         reviews(first: 50) {
           nodes {
             author { login }

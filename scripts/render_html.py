@@ -232,11 +232,21 @@ HTML = r"""<!doctype html>
   in the bots list. Senior contributors often shift toward review and away from authoring;
   without this column, that work is invisible.</p>
 
+  <h3>PRs are credit-weighted</h3>
+  <p>Each merged PR is split across its commit authors by share of additions.
+  A PR whose lines are 80% authored by A and 20% by B counts as 0.8 PRs for A
+  and 0.2 for B. This means the column can show fractional values (e.g. 12.4)
+  when contributors finish each other's branches or pair on a single PR. The
+  goal: opening someone else's branch as your own PR doesn't inflate your number,
+  and contributing meaningfully to someone else's PR shows up in yours.</p>
+
   <h3>Rework rate</h3>
   <p>Counts merged PRs that were later reverted by another merged PR. Detection:
   a subsequent merged PR with title starting <code>Revert</code>/<code>revert</code>
-  that references the original PR number in its title or body. Rates are hidden
-  for contributors with fewer than 5 PRs in the slice — too noisy below that.</p>
+  that references the original PR number in its title or body. The rate uses
+  credit-weighted PR counts (see above) on both sides — a PR with shared
+  authorship splits the "blame" the same way it splits the credit. Rates
+  are hidden for contributors with fewer than 5 (credit-weighted) PRs.</p>
   <div class="callout">
     What this is <strong>not</strong>: a measure of code quality. Known biases:
     hot-file work has higher revert rates regardless of skill; recent PRs haven't

@@ -156,24 +156,58 @@ print(f"Rework signal: {len(reverted_pr_numbers)} PRs were later reverted",
       file=sys.stderr)
 
 def empty_pr_stats():
-    return {"prs": 0, "prs_reverted": 0, "reviews": 0,
+    return {"prs": 0, "pr_credit": 0.0,
+            "prs_reverted": 0, "pr_credit_reverted": 0.0,
+            "reviews": 0,
             "ttm_seconds": 0, "ttm_count": 0,
             "pr_commit_total": 0, "pr_count_for_commits": 0}
 
 pr_slices = {s: defaultdict(empty_pr_stats) for s in SLICES}
 
+def compute_pr_shares(pr, fallback_login):
+    """
+    Split PR credit across commit authors by share of additions. Bot-authored
+    commits (Copilot, Cursor agent, etc.) inside a human's PR get attributed
+    to the PR opener — they're supervising the tool, not the tool itself.
+    Returns {gh_login: share_in_[0,1]}.
+    """
+    author_adds = defaultdict(int)
+    total = 0
+    for cnode in pr.get("commits", {}).get("nodes", []):
+        c = cnode.get("commit") or {}
+        a = c.get("author") or {}
+        u_obj = a.get("user") or {}
+        login = u_obj.get("login") or fallback_login
+        if login in BOTS:
+            login = fallback_login    # bot's commits → PR opener
+        adds = c.get("additions", 0) or 0
+        author_adds[login] += adds
+        total += adds
+    if total > 0:
+        return {u: adds / total for u, adds in author_adds.items()}
+    return {fallback_login: 1.0}
+
 for pr in all_prs:
     if not pr.get("author"):
         continue
-    author_login = pr["author"]["login"]
-    if author_login in BOTS:
+    pr_author_login = pr["author"]["login"]
+    if pr_author_login in BOTS:
         continue
+
     # Re-attribute trigger-bot PRs to the human who filed the originating issue.
-    if TRIGGER_BOT_LOGIN and author_login == TRIGGER_BOT_LOGIN:
+    # In that case the *whole* PR (including line credit) goes to the trigger;
+    # the bot's commits are not the human's but they're acting on the human's behalf.
+    if TRIGGER_BOT_LOGIN and pr_author_login == TRIGGER_BOT_LOGIN:
         trigger = TRIGGER_BOT_TRIGGERS.get(pr["number"])
         if trigger:
-            author_login = trigger
-    merged_at = datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00"))
+            pr_author_login = trigger
+            shares = {trigger: 1.0}
+        else:
+            shares = {pr_author_login: 1.0}
+    else:
+        shares = compute_pr_shares(pr, pr_author_login)
+
+    merged_at  = datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00"))
     created_at = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
     ttm_seconds = (merged_at - created_at).total_seconds()
     commits_count = pr.get("commits", {}).get("totalCount", 0)
@@ -182,22 +216,29 @@ for pr in all_prs:
     for s in SLICES:
         if not in_slice(merged_at, s):
             continue
-        stats = pr_slices[s][author_login]
-        stats["prs"] += 1
+        # Raw count (PR opener) — kept for ttm/legacy
+        opener = pr_slices[s][pr_author_login]
+        opener["prs"] += 1
         if was_reverted:
-            stats["prs_reverted"] += 1
-        stats["ttm_seconds"] += ttm_seconds
-        stats["ttm_count"] += 1
+            opener["prs_reverted"] += 1
+        opener["ttm_seconds"] += ttm_seconds
+        opener["ttm_count"] += 1
         if commits_count:
-            stats["pr_commit_total"] += commits_count
-            stats["pr_count_for_commits"] += 1
+            opener["pr_commit_total"] += commits_count
+            opener["pr_count_for_commits"] += 1
+        # Fractional credit by line authorship
+        for u, share in shares.items():
+            stats = pr_slices[s][u]
+            stats["pr_credit"] += share
+            if was_reverted:
+                stats["pr_credit_reverted"] += share
 
     # Reviews
     for review in pr.get("reviews", {}).get("nodes", []):
         if not review.get("author"):
             continue
         r_login = review["author"]["login"]
-        if r_login in BOTS or r_login == author_login:  # don't count self-reviews
+        if r_login in BOTS or r_login == pr_author_login:  # don't count self-reviews
             continue
         r_ts = datetime.fromisoformat(review["submittedAt"].replace("Z", "+00:00")) if review.get("submittedAt") else merged_at
         for s in SLICES:
@@ -294,17 +335,18 @@ for name in all_names:
         gd = slices_data[s].get(name, empty_stats())
         # PR data — match by gh login (handle the same login mapping to multiple names)
         pd = pr_slices[s].get(gh, empty_pr_stats())
-        rework_rate = (round(100 * pd["prs_reverted"] / pd["prs"], 1)
-                       if pd["prs"] >= REWORK_MIN_PRS else None)
+        rework_rate = (round(100 * pd["pr_credit_reverted"] / pd["pr_credit"], 1)
+                       if pd["pr_credit"] >= REWORK_MIN_PRS else None)
         record["slices"][s] = {
             "commits": gd["commits"],
             "add": gd["add"],
             "del": gd["del"],
             "net": gd["add"] - gd["del"],
             "files": gd["files_touched"] if isinstance(gd["files_touched"], int) else len(gd["files_touched"]),
-            "prs": pd["prs"],
+            "prs": round(pd["pr_credit"], 1),       # credit-weighted: split by commit-author share
+            "prs_raw": pd["prs"],                    # # of PRs opened by this user
             "reviews": pd["reviews"],
-            "rework_count": pd["prs_reverted"],
+            "rework_count": round(pd["pr_credit_reverted"], 1),
             "rework_rate": rework_rate,
         }
     contributors[name] = record
@@ -324,7 +366,7 @@ for s in SLICES:
         sl = r["slices"][s]
         t["commits"] += sl["commits"]
         t["add"] += sl["add"]
-        t["prs"] += sl["prs"]
+        t["prs"] += sl.get("prs_raw", 0)        # totals show raw count, not credit
         t["reviews"] += sl["reviews"]
         if sl["commits"] or sl["add"] or sl["prs"] or sl["reviews"]:
             t["people"] += 1
