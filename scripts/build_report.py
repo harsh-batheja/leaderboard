@@ -131,11 +131,19 @@ print(f"Parsed git data: {len(slices_data['all'])} authors all-time, "
 
 # ─── 2. Parse PR data + reviews ────────────────────────────────────────────────
 
-# Load all PRs into memory (small — typically a few hundred to low thousands of rows).
+# Load all PRs into memory (small — typically a few hundred to low thousands).
+# GitHub's cursor pagination can emit the same PR on adjacent pages when the
+# sort key (createdAt) ties; dedupe by PR number to keep counts honest.
+_seen_pr_nums: set[int] = set()
 all_prs = []
 with open(DATA_DIR / "prs.jsonl") as f:
     for line in f:
-        all_prs.append(json.loads(line))
+        pr = json.loads(line)
+        n = pr.get("number")
+        if n in _seen_pr_nums:
+            continue
+        _seen_pr_nums.add(n)
+        all_prs.append(pr)
 
 # Detect "iteration": a PR is iterated-on if either
 #   (a) a later merged Revert PR points at it, OR
@@ -166,8 +174,10 @@ except FileNotFoundError:
 
 iterated_pr_numbers: set[int] = set()
 if SHOW_ITERATION:
-    # (a) Strict reverts via title/body cross-reference
-    reverted_pr_numbers: set[int] = set()
+    # (a) Strict reverts via title/body cross-reference. Track the chain so we
+    # can un-revert when a reverter was itself reverted (net effect: original
+    # PR's code is back, so it shouldn't count as iterated).
+    reverted_by: dict[int, int] = {}     # target_pr_number -> reverter_pr_number
     for pr in all_prs:
         title = pr.get("title") or ""
         body  = pr.get("body")  or ""
@@ -180,7 +190,26 @@ if SHOW_ITERATION:
                 target = int(m.group(1))
                 break
         if target and target != pr["number"]:
-            reverted_pr_numbers.add(target)
+            reverted_by[target] = pr["number"]
+
+    # A revert can itself be reverted ("Revert of Revert"). Net effect on the
+    # original is a parity walk: stuck(P) = not stuck(reverter(P)). Code at
+    # HEAD differs from P iff the chain length is odd.
+    _stuck_cache: dict[int, bool] = {}
+    def stuck(num: int) -> bool:
+        if num in _stuck_cache:
+            return _stuck_cache[num]
+        if num not in reverted_by:
+            _stuck_cache[num] = True
+            return True
+        result = not stuck(reverted_by[num])
+        _stuck_cache[num] = result
+        return result
+
+    reverted_pr_numbers: set[int] = {
+        target for target in reverted_by
+        if not stuck(target)        # only count PRs actually missing from HEAD
+    }
 
     # (b) Fix-followed: walk merged PRs in time order
     merged_sorted = sorted(
@@ -205,6 +234,10 @@ if SHOW_ITERATION:
             if not q_author or q_author == p_author or q_author in BOTS:
                 continue
             if not FIX_TITLE_RE.search(q.get("title") or ""):
+                continue
+            # Skip fixes whose own changes were reverted out — net effect on P
+            # is no iteration.
+            if not stuck(q["number"]):
                 continue
             q_files = files_by_pr.get(q["number"], set())
             if len(p_files & q_files) >= ITERATION_MIN_SHARED:

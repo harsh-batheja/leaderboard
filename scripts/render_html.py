@@ -298,6 +298,12 @@ HTML = r"""<!doctype html>
   <p>The rate uses credit-weighted PR counts on both sides (a PR with shared
   authorship splits the iteration the same way as the credit). Rates are
   hidden for contributors with fewer than 5 credit-weighted PRs.</p>
+  <p><strong>Revert chains are unwound.</strong> If the iterating PR was
+  itself reverted (or its revert was reverted), the parity is followed back
+  to whether the change actually landed in HEAD. Iterated only counts when
+  the iterating change still exists in main. Caveat: this only catches
+  explicit <code>Revert</code> markers — a hand-rewrite that happens to
+  restore the original code doesn't leave a git-detectable trail.</p>
   <div class="callout">
     <strong>This is not a defect rate.</strong> It includes legitimate
     iteration: hot files get follow-up fixes regardless of whether the
