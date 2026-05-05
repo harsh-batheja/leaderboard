@@ -297,6 +297,24 @@ HTML = r"""<!doctype html>
   </div>
 
   <div data-feature="iteration">
+  <h3>Optional: iteration-based credit delta</h3>
+  <p>Off by default. When the build is run with <code>ITERATION_CREDIT_DELTA=1</code>
+  (and <code>SHOW_ITERATION=1</code>), each fix-followup that touches an
+  iterated PR's files takes <code>ITERATION_DELTA_PER_FIX</code> (default 0.1)
+  of that PR's credit and gives it to the fixer. Total shift on a single PR
+  is capped at <code>ITERATION_DELTA_CAP</code> (default 0.3) so a hot file
+  with many follow-up fixes can't drain the original author past 30%.
+  Strict reverts do not shift credit (a revert undoes work, it doesn't add
+  value) — only <code>fix:</code>-titled follow-ups do.</p>
+  <div class="callout">
+    Iteration fires far more often than similarity (~178 PRs vs ~10 in this
+    repo), so the lever is bigger. Defaults are deliberately small. Hot-file
+    workers will lose meaningful credit when this is on; skim the
+    methodology block on iteration above before turning this on.
+  </div>
+  </div>
+
+  <div data-feature="iteration">
   <h3>Iteration rate</h3>
   <p>Counts merged PRs that <em>another author</em> later iterated on. A PR is
   iterated-on if either:</p>
@@ -374,11 +392,21 @@ function hideDisabledFeatures() {
 }
 hideDisabledFeatures();
 
-if (DATA.credit_delta_enabled) {
-  const badge = document.getElementById("creditDeltaBadge");
-  const n = (DATA.credit_delta_log || []).length;
-  badge.textContent = `Credit-delta ON · ${n} pair${n===1?"":"s"} applied`;
-  badge.style.display = "inline-block";
+{
+  const parts = [];
+  if (DATA.credit_delta_enabled) {
+    const n = (DATA.credit_delta_log || []).length;
+    parts.push(`similarity (${n} pair${n===1?"":"s"})`);
+  }
+  if (DATA.iteration_delta_enabled) {
+    const n = (DATA.iteration_delta_log || []).length;
+    parts.push(`iteration (${n} fix${n===1?"":"es"})`);
+  }
+  if (parts.length) {
+    const badge = document.getElementById("creditDeltaBadge");
+    badge.textContent = `Credit-delta ON · ${parts.join(" + ")}`;
+    badge.style.display = "inline-block";
+  }
 }
 
 // Package color palette

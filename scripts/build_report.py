@@ -173,6 +173,7 @@ except FileNotFoundError:
     pass
 
 iterated_pr_numbers: set[int] = set()
+fix_followed_by: dict[int, list[tuple[int, str]]] = defaultdict(list)
 if SHOW_ITERATION:
     # (a) Strict reverts via title/body cross-reference. Track the chain so we
     # can un-revert when a reverter was itself reverted (net effect: original
@@ -217,6 +218,9 @@ if SHOW_ITERATION:
         key=lambda pr: pr["mergedAt"],
     )
     fix_followed_pr_numbers: set[int] = set()
+    # iterated PR -> list of (fixer_pr_number, fixer_author_login). Used by
+    # the optional iteration credit delta below; for the binary iteration
+    # signal we just take the keys.
     for i, p in enumerate(merged_sorted):
         p_num    = p["number"]
         p_author = (p.get("author") or {}).get("login")
@@ -242,7 +246,8 @@ if SHOW_ITERATION:
             q_files = files_by_pr.get(q["number"], set())
             if len(p_files & q_files) >= ITERATION_MIN_SHARED:
                 fix_followed_pr_numbers.add(p_num)
-                break
+                fix_followed_by[p_num].append((q["number"], q_author))
+                # Keep collecting; multiple fixers may each earn iteration credit.
 
     iterated_pr_numbers = reverted_pr_numbers | fix_followed_pr_numbers
     print(f"Iteration signal: {len(iterated_pr_numbers)} PRs iterated on "
@@ -554,11 +559,61 @@ if CREDIT_DELTA_ENABLED:
                 "applied":       applied,
             })
 
-    print(f"Credit delta: applied to {len(credit_delta_log)} pairs "
+    print(f"Similarity credit delta: applied to {len(credit_delta_log)} pairs "
           f"(cap {CREDIT_DELTA_CAP}, total entries {sum(len(p['applied']) for p in credit_delta_log)})",
           file=sys.stderr)
 else:
-    print("Credit delta: disabled (set SIMILARITY_CREDIT_DELTA=1 to enable)",
+    print("Similarity credit delta: disabled (set SIMILARITY_CREDIT_DELTA=1 to enable)",
+          file=sys.stderr)
+
+# Iteration credit delta: each fix-followup earns a small slice of credit from
+# the iterated PR's contributors. Independent flag, independent cap.
+ITERATION_CREDIT_DELTA = _flag("ITERATION_CREDIT_DELTA") and SHOW_ITERATION
+if _flag("ITERATION_CREDIT_DELTA") and not SHOW_ITERATION:
+    print("WARN: ITERATION_CREDIT_DELTA requires SHOW_ITERATION=1; disabled.",
+          file=sys.stderr)
+ITERATION_DELTA_PER_FIX = float(os.environ.get("ITERATION_DELTA_PER_FIX", "0.1"))
+ITERATION_DELTA_CAP     = float(os.environ.get("ITERATION_DELTA_CAP",     "0.3"))
+
+iteration_delta_log = []
+if ITERATION_CREDIT_DELTA:
+    for p_num, fixers in fix_followed_by.items():
+        log = pr_credit_log.get(p_num)
+        if not log or not fixers:
+            continue
+        already = 0.0
+        for q_num, q_author in fixers:
+            if q_author in BOTS:
+                continue
+            budget = ITERATION_DELTA_CAP - already
+            if budget <= 0:
+                break
+            shift = min(ITERATION_DELTA_PER_FIX, budget)
+            applied = []
+            for from_login, share in log["shares"].items():
+                if from_login == q_author or from_login in BOTS:
+                    continue
+                amount = share * shift
+                if amount <= 0:
+                    continue
+                for s in log["slices"]:
+                    pr_slices[s][from_login]["pr_credit"] -= amount
+                    pr_slices[s][q_author]["pr_credit"]   += amount
+                applied.append({"from": from_login, "to": q_author, "amount": round(amount, 3)})
+            if applied:
+                already += shift
+                iteration_delta_log.append({
+                    "iterated":  p_num,
+                    "fixer":     q_num,
+                    "shift_pct": round(shift, 2),
+                    "applied":   applied,
+                })
+
+    print(f"Iteration credit delta: applied {len(iteration_delta_log)} fix-followups "
+          f"(per-fix {ITERATION_DELTA_PER_FIX}, cap {ITERATION_DELTA_CAP})",
+          file=sys.stderr)
+else:
+    print("Iteration credit delta: disabled (set ITERATION_CREDIT_DELTA=1 to enable, requires SHOW_ITERATION=1)",
           file=sys.stderr)
 
 # ─── 10. Build the unified contributor records ────────────────────────────────
@@ -660,6 +715,10 @@ data = {
     "credit_delta_enabled": CREDIT_DELTA_ENABLED,
     "credit_delta_cap": CREDIT_DELTA_CAP if CREDIT_DELTA_ENABLED else None,
     "credit_delta_log": credit_delta_log,
+    "iteration_delta_enabled":   ITERATION_CREDIT_DELTA,
+    "iteration_delta_per_fix":   ITERATION_DELTA_PER_FIX if ITERATION_CREDIT_DELTA else None,
+    "iteration_delta_cap":       ITERATION_DELTA_CAP     if ITERATION_CREDIT_DELTA else None,
+    "iteration_delta_log":       iteration_delta_log,
 }
 
 out_path = DATA_DIR / "report_data.json"

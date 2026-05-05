@@ -80,13 +80,16 @@ team decides what to put on their own wall.
 | `SHOW_ITERATION=1` | Per-author Iteration column: % of your PRs that another author touched with a `fix:` or revert PR within 30d | off | Hot-file work has higher rates regardless of skill; punishes working in the iterated areas |
 | `SHOW_SIMILARITY=1` | "Possible re-implementation pairs" panel: closed-PR ↔ merged-PR file overlap | off | Heuristic — flags parallel work and post-merge follow-ups too |
 | `SIMILARITY_CREDIT_DELTA=1` | Auto-shift PR credit on flagged pairs (requires `SHOW_SIMILARITY=1`) | off | Propagates similarity false positives directly into leaderboard numbers; header shows a badge when active |
+| `ITERATION_CREDIT_DELTA=1` | Auto-shift PR credit from iterated PRs to their fixers (requires `SHOW_ITERATION=1`) | off | Bigger lever than similarity (iteration fires more often); hot-file work loses meaningful credit |
 
 Tunables (only used when the feature is on):
 
 ```
-ITERATION_WINDOW_DAYS=30   # how far forward to look for fix-followups
-ITERATION_MIN_SHARED=2     # min shared files to count as iteration
-SIMILARITY_DELTA_CAP=0.4   # max credit fraction shifted per merged PR
+ITERATION_WINDOW_DAYS=30      # how far forward to look for fix-followups
+ITERATION_MIN_SHARED=2        # min shared files to count as iteration
+SIMILARITY_DELTA_CAP=0.4      # max credit fraction shifted per merged PR
+ITERATION_DELTA_PER_FIX=0.1   # credit fraction each fix-followup earns
+ITERATION_DELTA_CAP=0.3       # max total iteration shift per merged PR
 ```
 
 The methodology section on the page documents the bias for each enabled
