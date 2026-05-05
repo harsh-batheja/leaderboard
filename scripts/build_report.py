@@ -164,6 +164,10 @@ def empty_pr_stats():
 
 pr_slices = {s: defaultdict(empty_pr_stats) for s in SLICES}
 
+# Per-PR record of who got credit and in which slices — needed to subtract
+# specific shares later when applying similarity-based credit shifts.
+pr_credit_log: dict[int, dict] = {}    # pr_number -> {"shares": {login: share}, "slices": [...]}
+
 def compute_pr_shares(pr, fallback_login):
     """
     Split PR credit across commit authors by share of additions. Bot-authored
@@ -213,9 +217,11 @@ for pr in all_prs:
     commits_count = pr.get("commits", {}).get("totalCount", 0)
     was_reverted = pr["number"] in reverted_pr_numbers
 
+    active_slices = []
     for s in SLICES:
         if not in_slice(merged_at, s):
             continue
+        active_slices.append(s)
         # Raw count (PR opener) — kept for ttm/legacy
         opener = pr_slices[s][pr_author_login]
         opener["prs"] += 1
@@ -232,6 +238,9 @@ for pr in all_prs:
             stats["pr_credit"] += share
             if was_reverted:
                 stats["pr_credit_reverted"] += share
+
+    if active_slices:
+        pr_credit_log[pr["number"]] = {"shares": dict(shares), "slices": active_slices}
 
     # Reviews
     for review in pr.get("reviews", {}).get("nodes", []):
@@ -305,79 +314,12 @@ for name, files in per_author_file_add.items():
     for path, add in files.items():
         per_author_packages[name][package_of(path)] += add
 
-# ─── 7. Build the unified contributor records ──────────────────────────────────
-
-# Combine git + PR data via NAME_TO_GH / GH_TO_NAME mapping.
-# Canonical key = display name. For PR-only contributors with no git presence,
-# the gh login becomes the display name.
-
-all_names = set(slices_data["all"].keys())
-for s in pr_slices:
-    for login in pr_slices[s]:
-        all_names.add(GH_TO_NAME.get(login, login))
-
-contributors = {}
-weeks_sorted = sorted(weeks_seen)
-
-for name in all_names:
-    if name in BOTS:
-        continue
-    gh = NAME_TO_GH.get(name, name)
-    record = {
-        "ghLogin": gh,
-        "slices": {},
-        "weighted_lines": round(weighted_lines.get(name, 0)),
-        "top_files": top_files_per_author.get(name, []),
-        "packages": dict(per_author_packages.get(name, {})),
-        "sparkline": [commits_per_week[name].get(w, 0) for w in weeks_sorted],
-    }
-    for s in SLICES:
-        gd = slices_data[s].get(name, empty_stats())
-        # PR data — match by gh login (handle the same login mapping to multiple names)
-        pd = pr_slices[s].get(gh, empty_pr_stats())
-        rework_rate = (round(100 * pd["pr_credit_reverted"] / pd["pr_credit"], 1)
-                       if pd["pr_credit"] >= REWORK_MIN_PRS else None)
-        record["slices"][s] = {
-            "commits": gd["commits"],
-            "add": gd["add"],
-            "del": gd["del"],
-            "net": gd["add"] - gd["del"],
-            "files": gd["files_touched"] if isinstance(gd["files_touched"], int) else len(gd["files_touched"]),
-            "prs": round(pd["pr_credit"], 1),       # credit-weighted: split by commit-author share
-            "prs_raw": pd["prs"],                    # # of PRs opened by this user
-            "reviews": pd["reviews"],
-            "rework_count": round(pd["pr_credit_reverted"], 1),
-            "rework_rate": rework_rate,
-        }
-    contributors[name] = record
-
-# Drop completely empty contributors
-contributors = {n: r for n, r in contributors.items()
-                if any(s["commits"] or s["add"] or s["prs"] or s["reviews"] for s in r["slices"].values())}
-
-print(f"Final contributors: {len(contributors)}", file=sys.stderr)
-
-# ─── 8. Aggregate stats ────────────────────────────────────────────────────────
-
-totals = {}
-for s in SLICES:
-    t = {"commits": 0, "add": 0, "prs": 0, "reviews": 0, "people": 0}
-    for r in contributors.values():
-        sl = r["slices"][s]
-        t["commits"] += sl["commits"]
-        t["add"] += sl["add"]
-        t["prs"] += sl.get("prs_raw", 0)        # totals show raw count, not credit
-        t["reviews"] += sl["reviews"]
-        if sl["commits"] or sl["add"] or sl["prs"] or sl["reviews"]:
-            t["people"] += 1
-    totals[s] = t
-
-# ─── 9. Top hotspots for context display ───────────────────────────────────────
+# ─── 7. Top hotspots for context display ───────────────────────────────────────
 
 top_hotspots = [{"path": p, "commits": c, "weight": round(file_weight.get(p, 1.0), 2)}
                 for p, c in sorted(file_churn.items(), key=lambda x: -x[1])[:15]]
 
-# ─── 10. Diff-similarity (flagging only — does not affect credit) ──────────────
+# ─── 8. Diff-similarity (flagging only by default) ─────────────────────────────
 # Pairs (closed PR by A, merged PR by B) where A != B, the file sets overlap,
 # and the merge happened within a time window of the close. Heuristic only:
 # false positives include legitimate parallel work and post-merge follow-ups.
@@ -457,6 +399,124 @@ similarity_pairs.sort(key=lambda x: (-x["shared_files"], -x["file_overlap"]))
 similarity_pairs = similarity_pairs[:SIMILARITY_MAX_PAIRS]
 print(f"Similarity flags: {len(similarity_pairs)}", file=sys.stderr)
 
+# ─── 9. Optional: apply similarity-based credit deltas ────────────────────────
+# Off by default. When enabled, for each flagged pair where the merged PR came
+# AFTER the closed PR, shift `jaccard × per-author share` of the merged PR's
+# credit from each merged-PR contributor to the closed-PR author. Total shift
+# per merged PR is capped at SIMILARITY_DELTA_CAP. Rework attribution does NOT
+# shift — bugs in the merged version stay with whoever wrote them.
+
+CREDIT_DELTA_ENABLED = os.environ.get("SIMILARITY_CREDIT_DELTA", "0") == "1"
+CREDIT_DELTA_CAP     = float(os.environ.get("SIMILARITY_DELTA_CAP", "0.4"))
+
+credit_delta_log = []   # list of applied shifts, for transparency
+if CREDIT_DELTA_ENABLED:
+    pr_total_shifted: dict[int, float] = defaultdict(float)
+    for pair in similarity_pairs:
+        if pair["delta_days"] <= 0:
+            continue
+        m_num = pair["merged"]
+        log = pr_credit_log.get(m_num)
+        if not log:
+            continue
+        budget = CREDIT_DELTA_CAP - pr_total_shifted[m_num]
+        if budget <= 0:
+            continue
+        shift_pct = min(pair["file_overlap"], budget)
+        if shift_pct <= 0:
+            continue
+        pr_total_shifted[m_num] += shift_pct
+
+        to_login = pair["closed_author"]
+        applied  = []
+        for from_login, share in log["shares"].items():
+            if from_login == to_login or from_login in BOTS:
+                continue
+            amount = share * shift_pct
+            if amount <= 0:
+                continue
+            for s in log["slices"]:
+                pr_slices[s][from_login]["pr_credit"] -= amount
+                pr_slices[s][to_login]["pr_credit"] += amount
+            applied.append({"from": from_login, "to": to_login, "amount": round(amount, 3)})
+
+        if applied:
+            credit_delta_log.append({
+                "closed":        pair["closed"],
+                "merged":        m_num,
+                "shift_pct":     round(shift_pct, 2),
+                "applied":       applied,
+            })
+
+    print(f"Credit delta: applied to {len(credit_delta_log)} pairs "
+          f"(cap {CREDIT_DELTA_CAP}, total entries {sum(len(p['applied']) for p in credit_delta_log)})",
+          file=sys.stderr)
+else:
+    print("Credit delta: disabled (set SIMILARITY_CREDIT_DELTA=1 to enable)",
+          file=sys.stderr)
+
+# ─── 10. Build the unified contributor records ────────────────────────────────
+# Reads pr_slices AFTER credit deltas have been applied (if enabled).
+
+all_names = set(slices_data["all"].keys())
+for s in pr_slices:
+    for login in pr_slices[s]:
+        all_names.add(GH_TO_NAME.get(login, login))
+
+contributors = {}
+weeks_sorted = sorted(weeks_seen)
+
+for name in all_names:
+    if name in BOTS:
+        continue
+    gh = NAME_TO_GH.get(name, name)
+    record = {
+        "ghLogin": gh,
+        "slices": {},
+        "weighted_lines": round(weighted_lines.get(name, 0)),
+        "top_files": top_files_per_author.get(name, []),
+        "packages": dict(per_author_packages.get(name, {})),
+        "sparkline": [commits_per_week[name].get(w, 0) for w in weeks_sorted],
+    }
+    for s in SLICES:
+        gd = slices_data[s].get(name, empty_stats())
+        pd = pr_slices[s].get(gh, empty_pr_stats())
+        rework_rate = (round(100 * pd["pr_credit_reverted"] / pd["pr_credit"], 1)
+                       if pd["pr_credit"] >= REWORK_MIN_PRS else None)
+        record["slices"][s] = {
+            "commits": gd["commits"],
+            "add": gd["add"],
+            "del": gd["del"],
+            "net": gd["add"] - gd["del"],
+            "files": gd["files_touched"] if isinstance(gd["files_touched"], int) else len(gd["files_touched"]),
+            "prs": round(pd["pr_credit"], 1),       # credit-weighted: split by commit-author share
+            "prs_raw": pd["prs"],                    # # of PRs opened by this user
+            "reviews": pd["reviews"],
+            "rework_count": round(pd["pr_credit_reverted"], 1),
+            "rework_rate": rework_rate,
+        }
+    contributors[name] = record
+
+contributors = {n: r for n, r in contributors.items()
+                if any(s["commits"] or s["add"] or s["prs"] or s["reviews"] for s in r["slices"].values())}
+
+print(f"Final contributors: {len(contributors)}", file=sys.stderr)
+
+# ─── 11. Aggregate totals ──────────────────────────────────────────────────────
+
+totals = {}
+for s in SLICES:
+    t = {"commits": 0, "add": 0, "prs": 0, "reviews": 0, "people": 0}
+    for r in contributors.values():
+        sl = r["slices"][s]
+        t["commits"] += sl["commits"]
+        t["add"] += sl["add"]
+        t["prs"] += sl.get("prs_raw", 0)
+        t["reviews"] += sl["reviews"]
+        if sl["commits"] or sl["add"] or sl["prs"] or sl["reviews"]:
+            t["people"] += 1
+    totals[s] = t
+
 REPO_OWNER = os.environ.get("REPO_OWNER", "")
 REPO_NAME  = os.environ.get("REPO_NAME", "")
 repo_pr_url_base = (f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/"
@@ -471,6 +531,9 @@ data = {
     "contributors": contributors,
     "top_hotspots": top_hotspots,
     "similarity_pairs": similarity_pairs,
+    "credit_delta_enabled": CREDIT_DELTA_ENABLED,
+    "credit_delta_cap": CREDIT_DELTA_CAP if CREDIT_DELTA_ENABLED else None,
+    "credit_delta_log": credit_delta_log,
 }
 
 out_path = DATA_DIR / "report_data.json"

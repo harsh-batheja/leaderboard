@@ -68,6 +68,23 @@ re-attribute each PR to the human who filed the originating issue. Resolution
 order: PR body `Requested by @user` → linked-issue body `Reported by @user` →
 issue creator.
 
+## Re-implementation flagging (always on)
+
+A `Possible re-implementation pairs` panel lists `(closed PR by A, merged PR by B)`
+where the file sets overlap and the merge happened within ±90 days of the close.
+Heuristic only — false positives include parallel work, post-merge follow-ups, and
+two people both fixing the same hot file. Flag-only by default; doesn't change any
+leaderboard number.
+
+## Similarity-based credit delta (opt-in, off by default)
+
+Set `SIMILARITY_CREDIT_DELTA=1` in your config to shift PR credit from the merged
+author to the closed author for each flagged pair (where merge came after close).
+Shift = file-set Jaccard, capped at `SIMILARITY_DELTA_CAP` (default 0.4) per
+merged PR. Rework attribution does not shift. Use sparingly — propagates the
+flag's false-positive rate into leaderboard numbers. The page shows a badge in
+the header when this is active.
+
 ## What's measured
 
 - Commits, lines added/deleted, files touched

@@ -144,6 +144,9 @@ HTML = r"""<!doctype html>
   __PAGE_SUBTITLE__ ·
   Generated <span id="genTime"></span> ·
   Repo started __REPO_FIRST_COMMIT__
+  <span id="creditDeltaBadge" style="display:none; margin-left:8px; padding:2px 8px;
+        border:1px solid var(--accent); border-radius:4px; font-size:11px;
+        color:var(--accent);"></span>
 </div>
 
 <div class="controls">
@@ -266,6 +269,20 @@ HTML = r"""<!doctype html>
   goal: opening someone else's branch as your own PR doesn't inflate your number,
   and contributing meaningfully to someone else's PR shows up in yours.</p>
 
+  <h3>Optional: similarity-based credit delta</h3>
+  <p>Off by default. When the build is run with <code>SIMILARITY_CREDIT_DELTA=1</code>,
+  a fraction of each merged PR's credit is shifted to the author of any
+  earlier closed PR it overlaps with (see "Possible re-implementation pairs"
+  above). The shift equals the file-set Jaccard, capped at
+  <code>SIMILARITY_DELTA_CAP</code> (default 0.4) per merged PR. Rework
+  attribution does <em>not</em> shift — bugs in the merged version stay with
+  whoever wrote them.</p>
+  <div class="callout">
+    Auto-shift propagates the false-positive risk of similarity flagging into
+    leaderboard numbers. Use sparingly. The badge in the header indicates
+    whether deltas were applied for the current page.
+  </div>
+
   <h3>Rework rate</h3>
   <p>Counts merged PRs that were later reverted by another merged PR. Detection:
   a subsequent merged PR with title starting <code>Revert</code>/<code>revert</code>
@@ -314,6 +331,13 @@ let currentSlice = "all";
 let currentSort = { col: "weighted_lines", dir: "desc" };
 
 document.getElementById("genTime").textContent = new Date(DATA.generated_at).toLocaleString();
+
+if (DATA.credit_delta_enabled) {
+  const badge = document.getElementById("creditDeltaBadge");
+  const n = (DATA.credit_delta_log || []).length;
+  badge.textContent = `Credit-delta ON · ${n} pair${n===1?"":"s"} applied`;
+  badge.style.display = "inline-block";
+}
 
 // Package color palette
 const PKG_COLORS = ["#58a6ff","#3fb950","#d2a8ff","#ffa657","#f85149","#79c0ff",
