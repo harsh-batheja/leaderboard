@@ -292,21 +292,24 @@ for pr in all_prs:
     if not pr.get("author"):
         continue
     pr_author_login = pr["author"]["login"]
-    if pr_author_login in BOTS:
-        continue
 
     # Re-attribute trigger-bot PRs to the human who filed the originating issue.
-    # In that case the *whole* PR (including line credit) goes to the trigger;
-    # the bot's commits are not the human's but they're acting on the human's behalf.
+    # Done BEFORE the BOTS skip so the trigger bot can also live in BOTS (which
+    # excludes its reviews/commits) without dropping the PRs it opened.
     if TRIGGER_BOT_LOGIN and pr_author_login == TRIGGER_BOT_LOGIN:
         trigger = TRIGGER_BOT_TRIGGERS.get(pr["number"])
         if trigger:
             pr_author_login = trigger
             shares = {trigger: 1.0}
         else:
+            # No human trigger found — fall through; if the bot is in BOTS,
+            # the next check drops it entirely (correct for unattributed bot PRs).
             shares = {pr_author_login: 1.0}
     else:
         shares = compute_pr_shares(pr, pr_author_login)
+
+    if pr_author_login in BOTS:
+        continue
 
     merged_at  = datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00"))
     created_at = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
