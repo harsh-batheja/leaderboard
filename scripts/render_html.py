@@ -185,7 +185,7 @@ HTML = r"""<!doctype html>
     <th></th>
     <th data-sort="reviews">Reviews</th>
     <th></th>
-    <th data-sort="iteration_rate">Iteration</th>
+    <th data-sort="iteration_rate" data-feature="iteration">Iteration</th>
     <th data-sort="files">Files</th>
     <th>Activity (per week)</th>
   </tr></thead>
@@ -215,7 +215,7 @@ HTML = r"""<!doctype html>
 </table>
 </div>
 
-<details style="margin-top: 24px;">
+<details style="margin-top: 24px;" data-feature="similarity">
   <summary style="cursor: pointer; font-size: 18px; padding: 8px 0; border-bottom: 1px solid var(--border); color: var(--text);">
     Possible re-implementation pairs
     <span id="similarityCount" style="color: var(--muted); font-size: 13px;"></span>
@@ -269,6 +269,7 @@ HTML = r"""<!doctype html>
   goal: opening someone else's branch as your own PR doesn't inflate your number,
   and contributing meaningfully to someone else's PR shows up in yours.</p>
 
+  <div data-feature="similarity">
   <h3>Optional: similarity-based credit delta</h3>
   <p>Off by default. When the build is run with <code>SIMILARITY_CREDIT_DELTA=1</code>,
   a fraction of each merged PR's credit is shifted to the author of any
@@ -282,7 +283,9 @@ HTML = r"""<!doctype html>
     leaderboard numbers. Use sparingly. The badge in the header indicates
     whether deltas were applied for the current page.
   </div>
+  </div>
 
+  <div data-feature="iteration">
   <h3>Iteration rate</h3>
   <p>Counts merged PRs that <em>another author</em> later iterated on. A PR is
   iterated-on if either:</p>
@@ -304,12 +307,6 @@ HTML = r"""<!doctype html>
     this column as "how often does the code area you ship in get touched
     again soon," not "how often is your work wrong."
   </div>
-  <div class="callout">
-    What this is <strong>not</strong>: a measure of code quality. Known biases:
-    hot-file work has higher revert rates regardless of skill; recent PRs haven't
-    had time to develop regressions yet; reverts also happen for product reasons
-    (perf tuning, merge conflicts, plan changes), not just bugs. Read this column
-    alongside the others, not in isolation.
   </div>
 
   <h3>Per-author identity dedup via <code>.mailmap</code></h3>
@@ -345,6 +342,20 @@ let currentSlice = "all";
 let currentSort = { col: "weighted_lines", dir: "desc" };
 
 document.getElementById("genTime").textContent = new Date(DATA.generated_at).toLocaleString();
+
+// Hide markup for disabled features. Each gated element is tagged with
+// data-feature="<name>"; we strip them before any render runs.
+function hideDisabledFeatures() {
+  const features = {
+    iteration:  DATA.show_iteration,
+    similarity: DATA.show_similarity,
+  };
+  for (const [name, enabled] of Object.entries(features)) {
+    if (enabled) continue;
+    document.querySelectorAll(`[data-feature="${name}"]`).forEach(el => el.remove());
+  }
+}
+hideDisabledFeatures();
 
 if (DATA.credit_delta_enabled) {
   const badge = document.getElementById("creditDeltaBadge");
@@ -484,6 +495,9 @@ function renderTable() {
     const iterCell = (r.iteration_rate == null)
       ? `<span class="muted-num">—</span>`
       : `${r.iteration_rate}%<span class="muted-num"> ${r.iteration_count}/${r.prs}</span>`;
+    const iterTd = DATA.show_iteration
+      ? `<td class="num">${iterCell}</td>`
+      : "";
     tr.innerHTML = `
       <td class="name">${ghLink} <button class="expand-btn" data-name="${escape(r.name)}">▸</button></td>
       <td class="num">${fmt(r.weighted_lines)}</td>
@@ -498,7 +512,7 @@ function renderTable() {
       <td class="bar-cell">${bar(r.prs, maxP, "bar-p")}</td>
       <td class="num">${r.reviews}</td>
       <td class="bar-cell">${bar(r.reviews, maxR, "bar-r")}</td>
-      <td class="num">${iterCell}</td>
+      ${iterTd}
       <td class="num muted-num">${r.files}</td>
       <td>${sparklineSVG(r.sparkline)}</td>
     `;
@@ -507,7 +521,8 @@ function renderTable() {
     // Detail row (collapsible)
     const detail = document.createElement("tr");
     detail.style.display = "none";
-    detail.innerHTML = `<td colspan="16" style="padding: 0;"><div style="padding: 12px 32px;">${detailHTML(r)}</div></td>`;
+    const colspan = DATA.show_iteration ? 16 : 15;
+    detail.innerHTML = `<td colspan="${colspan}" style="padding: 0;"><div style="padding: 12px 32px;">${detailHTML(r)}</div></td>`;
     body.appendChild(detail);
   });
 
@@ -610,6 +625,7 @@ function renderHotspots() {
 }
 
 function renderSimilarity() {
+  if (!DATA.show_similarity) return;       // panel was already removed by hideDisabledFeatures
   const pairs = DATA.similarity_pairs || [];
   const base  = DATA.repo_pr_url_base || "";
   const linkPR = (n) => base ? `<a href="${base}${n}" target="_blank" rel="noopener">#${n}</a>` : `#${n}`;

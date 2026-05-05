@@ -68,22 +68,29 @@ re-attribute each PR to the human who filed the originating issue. Resolution
 order: PR body `Requested by @user` → linked-issue body `Reported by @user` →
 issue creator.
 
-## Re-implementation flagging (always on)
+## Feature flags — opt in to contested signals
 
-A `Possible re-implementation pairs` panel lists `(closed PR by A, merged PR by B)`
-where the file sets overlap and the merge happened within ±90 days of the close.
-Heuristic only — false positives include parallel work, post-merge follow-ups, and
-two people both fixing the same hot file. Flag-only by default; doesn't change any
-leaderboard number.
+The base leaderboard ships uncontested columns by default (commits, lines,
+PRs by line authorship, reviews, files, weighted lines, sparklines). Three
+features that move into judgment territory are gated behind env flags so each
+team decides what to put on their own wall.
 
-## Similarity-based credit delta (opt-in, off by default)
+| Flag | What it adds | Default | Bias profile |
+|---|---|---|---|
+| `SHOW_ITERATION=1` | Per-author Iteration column: % of your PRs that another author touched with a `fix:` or revert PR within 30d | off | Hot-file work has higher rates regardless of skill; punishes working in the iterated areas |
+| `SHOW_SIMILARITY=1` | "Possible re-implementation pairs" panel: closed-PR ↔ merged-PR file overlap | off | Heuristic — flags parallel work and post-merge follow-ups too |
+| `SIMILARITY_CREDIT_DELTA=1` | Auto-shift PR credit on flagged pairs (requires `SHOW_SIMILARITY=1`) | off | Propagates similarity false positives directly into leaderboard numbers; header shows a badge when active |
 
-Set `SIMILARITY_CREDIT_DELTA=1` in your config to shift PR credit from the merged
-author to the closed author for each flagged pair (where merge came after close).
-Shift = file-set Jaccard, capped at `SIMILARITY_DELTA_CAP` (default 0.4) per
-merged PR. Iteration attribution does not shift. Use sparingly — propagates
-the flag's false-positive rate into leaderboard numbers. The page shows a
-badge in the header when this is active.
+Tunables (only used when the feature is on):
+
+```
+ITERATION_WINDOW_DAYS=30   # how far forward to look for fix-followups
+ITERATION_MIN_SHARED=2     # min shared files to count as iteration
+SIMILARITY_DELTA_CAP=0.4   # max credit fraction shifted per merged PR
+```
+
+The methodology section on the page documents the bias for each enabled
+feature so it can't be turned on in private — viewers see the caveats.
 
 ## What's measured
 

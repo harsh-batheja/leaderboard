@@ -9,6 +9,14 @@ from pathlib import Path
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/_data"))
 REPO_FIRST_COMMIT = os.environ.get("REPO_FIRST_COMMIT", "")
 
+# ─── Feature flags (all default OFF) ──────────────────────────────────────────
+# These gate the contested / opinionated signals. Teams opt in via config.
+def _flag(name: str) -> bool:
+    return os.environ.get(name, "0") == "1"
+
+SHOW_ITERATION  = _flag("SHOW_ITERATION")    # per-author iteration column
+SHOW_SIMILARITY = _flag("SHOW_SIMILARITY")   # re-implementation suspects panel
+
 # ─── Config ────────────────────────────────────────────────────────────────────
 
 def _load_json(env_var, default):
@@ -133,6 +141,7 @@ with open(DATA_DIR / "prs.jsonl") as f:
 #   (a) a later merged Revert PR points at it, OR
 #   (b) a later merged "fix"-titled PR by a different author touches ≥ N of its
 #       files within the iteration window (default 30 days).
+# Skipped entirely when SHOW_ITERATION is off.
 REVERT_TITLE_RE = re.compile(r'^\s*revert\b', re.IGNORECASE)
 TITLE_HASH_RE   = re.compile(r'\(#(\d+)\)')
 TITLE_PR_RE     = re.compile(r'\bPR\s*#(\d+)', re.IGNORECASE)
@@ -142,24 +151,7 @@ FIX_TITLE_RE    = re.compile(r'^\s*fix\b', re.IGNORECASE)
 ITERATION_WINDOW_DAYS = int(os.environ.get("ITERATION_WINDOW_DAYS", "30"))
 ITERATION_MIN_SHARED  = int(os.environ.get("ITERATION_MIN_SHARED",  "2"))
 
-# (a) Strict reverts via title/body cross-reference
-reverted_pr_numbers: set[int] = set()
-for pr in all_prs:
-    title = pr.get("title") or ""
-    body  = pr.get("body")  or ""
-    if not REVERT_TITLE_RE.search(title):
-        continue
-    target = None
-    for rx in (TITLE_HASH_RE, TITLE_PR_RE, BODY_REVERTS_RE):
-        m = rx.search(title) or rx.search(body)
-        if m:
-            target = int(m.group(1))
-            break
-    if target and target != pr["number"]:
-        reverted_pr_numbers.add(target)
-
-# (b) Fix-followed: load file lists from pr_files.jsonl (already pulled for
-# the similarity scan) and walk merged PRs in time order.
+# Always load file lists if available — the similarity scan needs them too.
 files_by_pr: dict[int, set] = {}
 try:
     with open(DATA_DIR / "pr_files.jsonl") as f:
@@ -172,38 +164,60 @@ try:
 except FileNotFoundError:
     pass
 
-merged_sorted = sorted(
-    [pr for pr in all_prs if pr.get("mergedAt")],
-    key=lambda pr: pr["mergedAt"],
-)
-fix_followed_pr_numbers: set[int] = set()
-for i, p in enumerate(merged_sorted):
-    p_num    = p["number"]
-    p_author = (p.get("author") or {}).get("login")
-    if not p_author or p_author in BOTS:
-        continue
-    p_files  = files_by_pr.get(p_num, set())
-    if len(p_files) < ITERATION_MIN_SHARED:
-        continue
-    p_dt = datetime.fromisoformat(p["mergedAt"].replace("Z", "+00:00"))
-    for q in merged_sorted[i + 1:]:
-        q_dt = datetime.fromisoformat(q["mergedAt"].replace("Z", "+00:00"))
-        if (q_dt - p_dt).days > ITERATION_WINDOW_DAYS:
-            break
-        q_author = (q.get("author") or {}).get("login")
-        if not q_author or q_author == p_author or q_author in BOTS:
+iterated_pr_numbers: set[int] = set()
+if SHOW_ITERATION:
+    # (a) Strict reverts via title/body cross-reference
+    reverted_pr_numbers: set[int] = set()
+    for pr in all_prs:
+        title = pr.get("title") or ""
+        body  = pr.get("body")  or ""
+        if not REVERT_TITLE_RE.search(title):
             continue
-        if not FIX_TITLE_RE.search(q.get("title") or ""):
-            continue
-        q_files = files_by_pr.get(q["number"], set())
-        if len(p_files & q_files) >= ITERATION_MIN_SHARED:
-            fix_followed_pr_numbers.add(p_num)
-            break
+        target = None
+        for rx in (TITLE_HASH_RE, TITLE_PR_RE, BODY_REVERTS_RE):
+            m = rx.search(title) or rx.search(body)
+            if m:
+                target = int(m.group(1))
+                break
+        if target and target != pr["number"]:
+            reverted_pr_numbers.add(target)
 
-iterated_pr_numbers = reverted_pr_numbers | fix_followed_pr_numbers
-print(f"Iteration signal: {len(iterated_pr_numbers)} PRs iterated on "
-      f"({len(reverted_pr_numbers)} reverts + {len(fix_followed_pr_numbers)} fix-followed)",
-      file=sys.stderr)
+    # (b) Fix-followed: walk merged PRs in time order
+    merged_sorted = sorted(
+        [pr for pr in all_prs if pr.get("mergedAt")],
+        key=lambda pr: pr["mergedAt"],
+    )
+    fix_followed_pr_numbers: set[int] = set()
+    for i, p in enumerate(merged_sorted):
+        p_num    = p["number"]
+        p_author = (p.get("author") or {}).get("login")
+        if not p_author or p_author in BOTS:
+            continue
+        p_files  = files_by_pr.get(p_num, set())
+        if len(p_files) < ITERATION_MIN_SHARED:
+            continue
+        p_dt = datetime.fromisoformat(p["mergedAt"].replace("Z", "+00:00"))
+        for q in merged_sorted[i + 1:]:
+            q_dt = datetime.fromisoformat(q["mergedAt"].replace("Z", "+00:00"))
+            if (q_dt - p_dt).days > ITERATION_WINDOW_DAYS:
+                break
+            q_author = (q.get("author") or {}).get("login")
+            if not q_author or q_author == p_author or q_author in BOTS:
+                continue
+            if not FIX_TITLE_RE.search(q.get("title") or ""):
+                continue
+            q_files = files_by_pr.get(q["number"], set())
+            if len(p_files & q_files) >= ITERATION_MIN_SHARED:
+                fix_followed_pr_numbers.add(p_num)
+                break
+
+    iterated_pr_numbers = reverted_pr_numbers | fix_followed_pr_numbers
+    print(f"Iteration signal: {len(iterated_pr_numbers)} PRs iterated on "
+          f"({len(reverted_pr_numbers)} reverts + {len(fix_followed_pr_numbers)} fix-followed)",
+          file=sys.stderr)
+else:
+    print("Iteration signal: disabled (set SHOW_ITERATION=1 to enable)",
+          file=sys.stderr)
 
 def empty_pr_stats():
     return {"prs": 0, "pr_credit": 0.0,
@@ -385,25 +399,25 @@ SIMILARITY_JACCARD_HI = 0.5
 SIMILARITY_JACCARD_LO = 0.15
 SIMILARITY_SHARED_LO  = 10
 
-pr_files: dict[int, dict] = {}
-try:
-    with open(DATA_DIR / "pr_files.jsonl") as f:
-        for line in f:
-            pr = json.loads(line)
-            if not pr.get("author"):
-                continue
-            pr_files[pr["number"]] = {
-                "author": pr["author"]["login"],
-                "title": pr.get("title", ""),
-                "closedAt": datetime.fromisoformat(pr["closedAt"].replace("Z", "+00:00")) if pr.get("closedAt") else None,
-                "mergedAt": datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) if pr.get("mergedAt") else None,
-                "files": [n["path"] for n in pr.get("files", {}).get("nodes", []) if n.get("path")],
-            }
-except FileNotFoundError:
-    pass
-
 similarity_pairs = []
-if pr_files:
+if SHOW_SIMILARITY:
+    pr_files: dict[int, dict] = {}
+    try:
+        with open(DATA_DIR / "pr_files.jsonl") as f:
+            for line in f:
+                pr = json.loads(line)
+                if not pr.get("author"):
+                    continue
+                pr_files[pr["number"]] = {
+                    "author": pr["author"]["login"],
+                    "title": pr.get("title", ""),
+                    "closedAt": datetime.fromisoformat(pr["closedAt"].replace("Z", "+00:00")) if pr.get("closedAt") else None,
+                    "mergedAt": datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) if pr.get("mergedAt") else None,
+                    "files": [n["path"] for n in pr.get("files", {}).get("nodes", []) if n.get("path")],
+                }
+    except FileNotFoundError:
+        pass
+
     closed_prs = [(n, p) for n, p in pr_files.items()
                   if p["mergedAt"] is None and p["closedAt"] and len(p["files"]) >= SIMILARITY_MIN_FILES]
     merged_prs = [(n, p) for n, p in pr_files.items()
@@ -442,12 +456,15 @@ if pr_files:
                     "delta_days":      delta_days,
                 })
 
-# Sort by absolute shared-file count first (the most concrete signal),
-# tiebreak by overlap percentage. Keeps big-overlap, tight-match, and
-# many-files-in-common pairs near the top together.
-similarity_pairs.sort(key=lambda x: (-x["shared_files"], -x["file_overlap"]))
-similarity_pairs = similarity_pairs[:SIMILARITY_MAX_PAIRS]
-print(f"Similarity flags: {len(similarity_pairs)}", file=sys.stderr)
+    # Sort by absolute shared-file count first (the most concrete signal),
+    # tiebreak by overlap percentage. Keeps big-overlap, tight-match, and
+    # many-files-in-common pairs near the top together.
+    similarity_pairs.sort(key=lambda x: (-x["shared_files"], -x["file_overlap"]))
+    similarity_pairs = similarity_pairs[:SIMILARITY_MAX_PAIRS]
+    print(f"Similarity flags: {len(similarity_pairs)}", file=sys.stderr)
+else:
+    print("Similarity scan: disabled (set SHOW_SIMILARITY=1 to enable)",
+          file=sys.stderr)
 
 # ─── 9. Optional: apply similarity-based credit deltas ────────────────────────
 # Off by default. When enabled, for each flagged pair where the merged PR came
@@ -456,8 +473,11 @@ print(f"Similarity flags: {len(similarity_pairs)}", file=sys.stderr)
 # per merged PR is capped at SIMILARITY_DELTA_CAP. Iteration attribution does
 # NOT shift — fixes follow whoever wrote the merged code.
 
-CREDIT_DELTA_ENABLED = os.environ.get("SIMILARITY_CREDIT_DELTA", "0") == "1"
+CREDIT_DELTA_ENABLED = _flag("SIMILARITY_CREDIT_DELTA") and SHOW_SIMILARITY
 CREDIT_DELTA_CAP     = float(os.environ.get("SIMILARITY_DELTA_CAP", "0.4"))
+if _flag("SIMILARITY_CREDIT_DELTA") and not SHOW_SIMILARITY:
+    print("WARN: SIMILARITY_CREDIT_DELTA requires SHOW_SIMILARITY=1; disabled.",
+          file=sys.stderr)
 
 credit_delta_log = []   # list of applied shifts, for transparency
 if CREDIT_DELTA_ENABLED:
@@ -531,9 +551,7 @@ for name in all_names:
     for s in SLICES:
         gd = slices_data[s].get(name, empty_stats())
         pd = pr_slices[s].get(gh, empty_pr_stats())
-        iteration_rate = (round(100 * pd["pr_credit_iterated"] / pd["pr_credit"], 1)
-                          if pd["pr_credit"] >= ITERATION_MIN_PRS else None)
-        record["slices"][s] = {
+        slice_rec = {
             "commits": gd["commits"],
             "add": gd["add"],
             "del": gd["del"],
@@ -542,9 +560,14 @@ for name in all_names:
             "prs": round(pd["pr_credit"], 1),       # credit-weighted: split by commit-author share
             "prs_raw": pd["prs"],                    # # of PRs opened by this user
             "reviews": pd["reviews"],
-            "iteration_count": round(pd["pr_credit_iterated"], 1),
-            "iteration_rate": iteration_rate,
         }
+        if SHOW_ITERATION:
+            slice_rec["iteration_count"] = round(pd["pr_credit_iterated"], 1)
+            slice_rec["iteration_rate"]  = (
+                round(100 * pd["pr_credit_iterated"] / pd["pr_credit"], 1)
+                if pd["pr_credit"] >= ITERATION_MIN_PRS else None
+            )
+        record["slices"][s] = slice_rec
     contributors[name] = record
 
 contributors = {n: r for n, r in contributors.items()
@@ -580,6 +603,8 @@ data = {
     "totals": totals,
     "contributors": contributors,
     "top_hotspots": top_hotspots,
+    "show_iteration": SHOW_ITERATION,
+    "show_similarity": SHOW_SIMILARITY,
     "similarity_pairs": similarity_pairs,
     "credit_delta_enabled": CREDIT_DELTA_ENABLED,
     "credit_delta_cap": CREDIT_DELTA_CAP if CREDIT_DELTA_ENABLED else None,
