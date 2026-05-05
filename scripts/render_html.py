@@ -177,6 +177,7 @@ HTML = r"""<!doctype html>
     <th></th>
     <th data-sort="commits">Commits</th>
     <th></th>
+    <th data-sort="commits_per_pr">C/PR</th>
     <th data-sort="add">Lines+</th>
     <th data-sort="del">Lines−</th>
     <th data-sort="net">Net</th>
@@ -260,6 +261,16 @@ HTML = r"""<!doctype html>
   reviews on other people's PRs, excluding self-comments and the bots/AI-reviewers configured
   in the bots list. Senior contributors often shift toward review and away from authoring;
   without this column, that work is invisible.</p>
+
+  <h3>Commits and merge strategy (the C/PR column)</h3>
+  <p>The "Commits" column counts post-merge git authors. Squash-merging
+  collapses every PR into one commit (low ratio); rebase- or regular-merging
+  preserves every commit from the PR (high ratio). On the same team for the
+  same kind of work the C/PR column can range from ~0.1 (always squash) to
+  ~10 (rebase or regular merge). High C/PR doesn't mean more work shipped,
+  just a different merge style — read the two columns together. If your team
+  squashes uniformly, "Commits" approximates "PRs" and C/PR sits near 1.0
+  for everyone.</p>
 
   <h3>PRs are credit-weighted</h3>
   <p>Each merged PR is split across its commit authors by share of additions.
@@ -398,6 +409,7 @@ function getRows() {
       ghLogin: r.ghLogin,
       weighted_lines: r.weighted_lines,
       commits: s.commits,
+      commits_per_pr: s.commits_per_pr,
       add: s.add,
       del: s.del,
       net: s.net,
@@ -501,6 +513,9 @@ function renderTable() {
     const iterCell = (r.iteration_rate == null)
       ? `<span class="muted-num">—</span>`
       : `${r.iteration_rate}%<span class="muted-num"> ${r.iteration_count}/${r.prs}</span>`;
+    const cprCell = (r.commits_per_pr == null)
+      ? `<span class="muted-num">—</span>`
+      : r.commits_per_pr.toFixed(1);
     const iterTd = DATA.show_iteration
       ? `<td class="num">${iterCell}</td>`
       : "";
@@ -510,6 +525,7 @@ function renderTable() {
       <td class="bar-cell">${bar(r.weighted_lines, maxW, "bar-w")}</td>
       <td class="num">${r.commits}</td>
       <td class="bar-cell">${bar(r.commits, maxC, "bar-c")}</td>
+      <td class="num muted-num">${cprCell}</td>
       <td class="num muted-num">${fmt(r.add)}</td>
       <td class="num muted-num">${fmt(r.del)}</td>
       <td class="num">${r.net >= 0 ? "+" : ""}${fmt(r.net)}</td>
@@ -527,7 +543,7 @@ function renderTable() {
     // Detail row (collapsible)
     const detail = document.createElement("tr");
     detail.style.display = "none";
-    const colspan = DATA.show_iteration ? 16 : 15;
+    const colspan = DATA.show_iteration ? 17 : 16;
     detail.innerHTML = `<td colspan="${colspan}" style="padding: 0;"><div style="padding: 12px 32px;">${detailHTML(r)}</div></td>`;
     body.appendChild(detail);
   });

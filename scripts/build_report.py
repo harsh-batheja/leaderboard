@@ -586,6 +586,10 @@ for name in all_names:
         pd = pr_slices[s].get(gh, empty_pr_stats())
         slice_rec = {
             "commits": gd["commits"],
+            "commits_per_pr": (
+                round(gd["commits"] / pd["prs"], 1)
+                if pd["prs"] > 0 else None
+            ),
             "add": gd["add"],
             "del": gd["del"],
             "net": gd["add"] - gd["del"],
