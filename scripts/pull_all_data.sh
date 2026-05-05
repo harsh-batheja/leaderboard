@@ -149,4 +149,46 @@ for pr in prs:
   echo "  Triggers resolved: $(wc -l < "$DATA_DIR/trigger_bot_triggers.tsv")" >&2
 fi
 
+# 7. PR file lists for similarity detection (closed + merged PRs)
+# Used to flag pairs where a closed PR by author A and a merged PR by author B
+# touch heavily-overlapping file sets within a time window.
+cat > "$DATA_DIR/files_query.graphql" <<GQL
+query(\$cursor: String) {
+  repository(owner: "$REPO_OWNER", name: "$REPO_NAME") {
+    pullRequests(first: 25, after: \$cursor, states: [MERGED, CLOSED], orderBy: {field: CREATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        author { login }
+        createdAt
+        closedAt
+        mergedAt
+        files(first: 50) {
+          nodes { path additions }
+        }
+      }
+    }
+  }
+}
+GQL
+
+: > "$DATA_DIR/pr_files.jsonl"
+cursor="null"
+page=0
+while true; do
+  page=$((page+1))
+  echo "  Fetching PR files page $page..." >&2
+  if [ "$cursor" = "null" ]; then
+    resp=$(gh api graphql -F query=@"$DATA_DIR/files_query.graphql")
+  else
+    resp=$(gh api graphql -F query=@"$DATA_DIR/files_query.graphql" -f cursor="$cursor")
+  fi
+  echo "$resp" | jq -c '.data.repository.pullRequests.nodes[]' >> "$DATA_DIR/pr_files.jsonl"
+  has_next=$(echo "$resp" | jq -r '.data.repository.pullRequests.pageInfo.hasNextPage')
+  cursor=$(echo "$resp" | jq -r '.data.repository.pullRequests.pageInfo.endCursor')
+  if [ "$has_next" != "true" ]; then break; fi
+done
+echo "  PR file lists: $(wc -l < "$DATA_DIR/pr_files.jsonl")" >&2
+
 ls -la "$DATA_DIR/"

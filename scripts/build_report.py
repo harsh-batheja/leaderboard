@@ -377,13 +377,100 @@ for s in SLICES:
 top_hotspots = [{"path": p, "commits": c, "weight": round(file_weight.get(p, 1.0), 2)}
                 for p, c in sorted(file_churn.items(), key=lambda x: -x[1])[:15]]
 
+# ─── 10. Diff-similarity (flagging only — does not affect credit) ──────────────
+# Pairs (closed PR by A, merged PR by B) where A != B, the file sets overlap,
+# and the merge happened within a time window of the close. Heuristic only:
+# false positives include legitimate parallel work and post-merge follow-ups.
+
+SIMILARITY_MIN_FILES        = 5    # ignore PRs touching < N files
+SIMILARITY_TIME_WINDOW_DAYS = 90   # merged within ±N days of closed
+SIMILARITY_MAX_PAIRS        = 40   # cap output
+# Flag if EITHER:
+#   - Jaccard ≥ JACCARD_HI (a tightly matched pair regardless of size), OR
+#   - Jaccard ≥ JACCARD_LO AND shared_files ≥ SHARED_LO (substantial absolute
+#     overlap even on a big PR with broader scope — catches partial re-impl).
+SIMILARITY_JACCARD_HI = 0.5
+SIMILARITY_JACCARD_LO = 0.15
+SIMILARITY_SHARED_LO  = 10
+
+pr_files: dict[int, dict] = {}
+try:
+    with open(DATA_DIR / "pr_files.jsonl") as f:
+        for line in f:
+            pr = json.loads(line)
+            if not pr.get("author"):
+                continue
+            pr_files[pr["number"]] = {
+                "author": pr["author"]["login"],
+                "title": pr.get("title", ""),
+                "closedAt": datetime.fromisoformat(pr["closedAt"].replace("Z", "+00:00")) if pr.get("closedAt") else None,
+                "mergedAt": datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) if pr.get("mergedAt") else None,
+                "files": [n["path"] for n in pr.get("files", {}).get("nodes", []) if n.get("path")],
+            }
+except FileNotFoundError:
+    pass
+
+similarity_pairs = []
+if pr_files:
+    closed_prs = [(n, p) for n, p in pr_files.items()
+                  if p["mergedAt"] is None and p["closedAt"] and len(p["files"]) >= SIMILARITY_MIN_FILES]
+    merged_prs = [(n, p) for n, p in pr_files.items()
+                  if p["mergedAt"] and len(p["files"]) >= SIMILARITY_MIN_FILES]
+    print(f"Similarity scan: {len(closed_prs)} closed × {len(merged_prs)} merged",
+          file=sys.stderr)
+    for cnum, c in closed_prs:
+        c_files = set(c["files"])
+        c_author = c["author"]
+        if c_author in BOTS:
+            continue
+        for mnum, m in merged_prs:
+            if m["author"] == c_author or m["author"] in BOTS:
+                continue
+            delta_days = (m["mergedAt"] - c["closedAt"]).days
+            if abs(delta_days) > SIMILARITY_TIME_WINDOW_DAYS:
+                continue
+            m_files = set(m["files"])
+            inter = c_files & m_files
+            if not inter:
+                continue
+            jaccard = len(inter) / len(c_files | m_files)
+            shared = len(inter)
+            keep = (jaccard >= SIMILARITY_JACCARD_HI) or \
+                   (jaccard >= SIMILARITY_JACCARD_LO and shared >= SIMILARITY_SHARED_LO)
+            if keep:
+                similarity_pairs.append({
+                    "closed":          cnum,
+                    "closed_author":   c_author,
+                    "closed_title":    c["title"],
+                    "merged":          mnum,
+                    "merged_author":   m["author"],
+                    "merged_title":    m["title"],
+                    "file_overlap":    round(jaccard, 2),
+                    "shared_files":    len(inter),
+                    "delta_days":      delta_days,
+                })
+
+# Sort by absolute shared-file count first (the most concrete signal),
+# tiebreak by overlap percentage. Keeps big-overlap, tight-match, and
+# many-files-in-common pairs near the top together.
+similarity_pairs.sort(key=lambda x: (-x["shared_files"], -x["file_overlap"]))
+similarity_pairs = similarity_pairs[:SIMILARITY_MAX_PAIRS]
+print(f"Similarity flags: {len(similarity_pairs)}", file=sys.stderr)
+
+REPO_OWNER = os.environ.get("REPO_OWNER", "")
+REPO_NAME  = os.environ.get("REPO_NAME", "")
+repo_pr_url_base = (f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/"
+                    if REPO_OWNER and REPO_NAME else "")
+
 data = {
     "generated_at": NOW.isoformat(),
     "repo_first_commit": REPO_FIRST_COMMIT,
+    "repo_pr_url_base": repo_pr_url_base,
     "weeks": weeks_sorted,
     "totals": totals,
     "contributors": contributors,
     "top_hotspots": top_hotspots,
+    "similarity_pairs": similarity_pairs,
 }
 
 out_path = DATA_DIR / "report_data.json"

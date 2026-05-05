@@ -212,6 +212,32 @@ HTML = r"""<!doctype html>
 </table>
 </div>
 
+<details style="margin-top: 24px;">
+  <summary style="cursor: pointer; font-size: 18px; padding: 8px 0; border-bottom: 1px solid var(--border); color: var(--text);">
+    Possible re-implementation pairs
+    <span id="similarityCount" style="color: var(--muted); font-size: 13px;"></span>
+  </summary>
+  <div class="reasoning" style="margin-top: 12px;">
+    <p>Pairs where a <strong>closed</strong> PR by author A and a <strong>merged</strong>
+    PR by author B (B ≠ A) touch a heavily overlapping file set within ±90 days.
+    File-level Jaccard similarity ≥ 50%, both PRs touching ≥ 5 files. Sorted by overlap.</p>
+    <div class="callout">
+      <strong>Heuristic only — not a verdict.</strong> Two people both touching the
+      auth module won't be re-implementations; two people fixing the same hot file
+      won't be either. Use this list to surface cases worth a human look. The
+      column does not affect any leaderboard number.
+    </div>
+    <table id="similarityTable">
+      <thead><tr>
+        <th>Closed PR</th><th>By</th>
+        <th>Merged PR</th><th>By</th>
+        <th>File overlap</th><th>Shared</th><th>Δ days</th>
+      </tr></thead>
+      <tbody id="similarityBody"></tbody>
+    </table>
+  </div>
+</details>
+
 <h2>Reasoning &amp; Methodology</h2>
 <div class="reasoning">
   <h3>Time slicing</h3>
@@ -545,6 +571,31 @@ function renderHotspots() {
   ).join("");
 }
 
+function renderSimilarity() {
+  const pairs = DATA.similarity_pairs || [];
+  const base  = DATA.repo_pr_url_base || "";
+  const linkPR = (n) => base ? `<a href="${base}${n}" target="_blank" rel="noopener">#${n}</a>` : `#${n}`;
+  const linkAuthor = (u) => `<a href="https://github.com/${escape(u)}" target="_blank" rel="noopener">${escape(u)}</a>`;
+  $("#similarityCount").textContent = pairs.length
+    ? `(${pairs.length} flagged)`
+    : "(none flagged)";
+  if (!pairs.length) {
+    $("#similarityBody").innerHTML = `<tr><td colspan="7" class="muted-num" style="text-align:center;">No pairs above the threshold.</td></tr>`;
+    return;
+  }
+  $("#similarityBody").innerHTML = pairs.map(p => `
+    <tr>
+      <td class="name">${linkPR(p.closed)} <span class="muted-num">${escape(p.closed_title || "")}</span></td>
+      <td class="muted-num">${linkAuthor(p.closed_author)}</td>
+      <td class="name">${linkPR(p.merged)} <span class="muted-num">${escape(p.merged_title || "")}</span></td>
+      <td class="muted-num">${linkAuthor(p.merged_author)}</td>
+      <td class="num">${Math.round(p.file_overlap * 100)}%</td>
+      <td class="num muted-num">${p.shared_files}</td>
+      <td class="num muted-num">${p.delta_days >= 0 ? "+" : ""}${p.delta_days}</td>
+    </tr>
+  `).join("");
+}
+
 // Wire up controls
 $$("#sliceToggle button").forEach(b => {
   b.addEventListener("click", () => {
@@ -574,6 +625,7 @@ renderTable();
 renderPackageTable();
 renderStandouts();
 renderHotspots();
+renderSimilarity();
 </script>
 </body>
 </html>
