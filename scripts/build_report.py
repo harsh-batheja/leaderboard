@@ -65,9 +65,19 @@ def _load_json(env_var, default):
     return json.loads(p.read_text())
 
 # Canonical name -> github login (joins git author names with PR author logins).
-# Format: {"Display Name": "gh_login", ...}.
-NAME_TO_GH: dict[str, str] = _load_json("IDENTITIES_FILE", {})
-GH_TO_NAME = {v: k for k, v in NAME_TO_GH.items()}
+# Format: {"Display Name": "gh_login"} or {"Display Name": ["primary_login", "alt_login", ...]}.
+# When a list is given, the first entry is the primary login (used for profile links);
+# every entry is treated as the same person when joining commits to PRs/reviews.
+_RAW_IDENTITIES = _load_json("IDENTITIES_FILE", {})
+NAME_TO_GH: dict[str, str] = {}
+GH_TO_NAME: dict[str, str] = {}
+for _name, _val in _RAW_IDENTITIES.items():
+    _logins = [_val] if isinstance(_val, str) else list(_val)
+    if not _logins:
+        continue
+    NAME_TO_GH[_name] = _logins[0]
+    for _login in _logins:
+        GH_TO_NAME[_login] = _name
 
 # Names/logins to exclude entirely (bots, AI reviewers, etc.)
 BOTS: set[str] = set(_load_json("BOTS_FILE", []))
