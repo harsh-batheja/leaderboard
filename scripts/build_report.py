@@ -16,6 +16,14 @@ def _flag(name: str) -> bool:
 
 SHOW_ITERATION  = _flag("SHOW_ITERATION")    # per-author iteration column
 SHOW_SIMILARITY = _flag("SHOW_SIMILARITY")   # re-implementation suspects panel
+SHOW_STREAK     = _flag("SHOW_STREAK")       # per-author streak + active weeks columns
+
+# Extra time slices to include in the toggle. Comma-separated codes from:
+#   q90  = last 90 days   (quarter)
+#   h180 = last 180 days  (half-year)
+#   y365 = last 365 days  (year)
+# Default: none (toggle stays at all/30d/7d).
+EXTRA_SLICES_REQUESTED = [s.strip() for s in os.environ.get("EXTRA_SLICES","").split(",") if s.strip()]
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -52,11 +60,29 @@ if TRIGGER_BOT_LOGIN:
         pass
 
 NOW = datetime.now(timezone.utc)
-SLICES = {
-    "all": None,          # all-time
-    "d30": timedelta(days=30),
-    "d7":  timedelta(days=7),
+
+# Slice ordering matters for the toggle UI (longest → shortest).
+SLICE_BASE = [
+    ("all",  None,                 "All-time"),
+    ("d30",  timedelta(days=30),   "Last 30 days"),
+    ("d7",   timedelta(days=7),    "Last 7 days"),
+]
+SLICE_EXTRAS = {
+    "q90":  (timedelta(days=90),   "Last 90 days"),
+    "h180": (timedelta(days=180),  "Last 6 months"),
+    "y365": (timedelta(days=365),  "Last year"),
 }
+# Insert extras after "all" in length order: y365, h180, q90, then d30, d7
+EXTRAS_IN_ORDER = ["y365", "h180", "q90"]
+slices_ordered = [SLICE_BASE[0]]
+for code in EXTRAS_IN_ORDER:
+    if code in EXTRA_SLICES_REQUESTED:
+        delta, label = SLICE_EXTRAS[code]
+        slices_ordered.append((code, delta, label))
+slices_ordered.extend(SLICE_BASE[1:])
+
+SLICES = {code: delta for code, delta, _ in slices_ordered}
+SLICE_LABELS = {code: label for code, _, label in slices_ordered}
 
 def in_slice(ts: datetime, name: str) -> bool:
     delta = SLICES[name]
@@ -79,6 +105,11 @@ per_author_file_add = defaultdict(lambda: defaultdict(int))  # name -> file -> a
 commits_per_week = defaultdict(lambda: defaultdict(int))  # name -> iso-week -> count
 weeks_seen = set()
 
+# Per-author set of ISO weeks where they had ANY activity (commit, PR merge, or
+# review). Used by the optional streak/active-weeks columns.
+weekly_activity: dict[str, set[str]] = defaultdict(set)
+earliest_activity_ts: datetime | None = None
+
 # Parse the raw git log
 current_author = None
 current_ts = None
@@ -99,6 +130,9 @@ with open(DATA_DIR / "commits_numstat.tsv") as f:
             week = current_ts.strftime("%Y-W%V")
             weeks_seen.add(week)
             commits_per_week[current_author][week] += 1
+            weekly_activity[current_author].add(week)
+            if earliest_activity_ts is None or current_ts < earliest_activity_ts:
+                earliest_activity_ts = current_ts
             for s in SLICES:
                 if in_slice(current_ts, s):
                     if current_sha not in seen_commit or True:
@@ -322,6 +356,15 @@ for pr in all_prs:
     commits_count = pr.get("commits", {}).get("totalCount", 0)
     was_iterated = pr["number"] in iterated_pr_numbers
 
+    # Track activity for streak/active-weeks (keyed by display name to match
+    # the contributor record). Counts each PR-author and reviewer for the week
+    # of the merge / review.
+    merge_week = merged_at.strftime("%Y-W%V")
+    pr_display = GH_TO_NAME.get(pr_author_login, pr_author_login)
+    weekly_activity[pr_display].add(merge_week)
+    if earliest_activity_ts is None or merged_at < earliest_activity_ts:
+        earliest_activity_ts = merged_at
+
     active_slices = []
     for s in SLICES:
         if not in_slice(merged_at, s):
@@ -355,6 +398,10 @@ for pr in all_prs:
         if r_login in BOTS or r_login == pr_author_login:  # don't count self-reviews
             continue
         r_ts = datetime.fromisoformat(review["submittedAt"].replace("Z", "+00:00")) if review.get("submittedAt") else merged_at
+        review_week = r_ts.strftime("%Y-W%V")
+        weekly_activity[GH_TO_NAME.get(r_login, r_login)].add(review_week)
+        if earliest_activity_ts is None or r_ts < earliest_activity_ts:
+            earliest_activity_ts = r_ts
         for s in SLICES:
             if in_slice(r_ts, s):
                 pr_slices[s][r_login]["reviews"] += 1
@@ -616,6 +663,55 @@ else:
     print("Iteration credit delta: disabled (set ITERATION_CREDIT_DELTA=1 to enable, requires SHOW_ITERATION=1)",
           file=sys.stderr)
 
+# ─── Streak / active-weeks calendar enumeration ──────────────────────────────
+# Build the calendar (every ISO week) inside each slice once, then look up each
+# author's activity-set against it. Skipped when SHOW_STREAK is off — even the
+# enumeration is wasted otherwise.
+
+slice_calendar_weeks: dict[str, list[str]] = {}
+if SHOW_STREAK:
+    all_time_start = earliest_activity_ts or NOW
+    for s, delta in SLICES.items():
+        start = (NOW - delta) if delta is not None else all_time_start
+        weeks: list[str] = []
+        seen_w: set[str] = set()
+        cur = start
+        while cur <= NOW:
+            wk = cur.strftime("%Y-W%V")
+            if wk not in seen_w:
+                seen_w.add(wk)
+                weeks.append(wk)
+            cur += timedelta(days=1)
+        slice_calendar_weeks[s] = weeks
+    print(f"Streak calendars: " +
+          ", ".join(f"{s}={len(w)}w" for s, w in slice_calendar_weeks.items()),
+          file=sys.stderr)
+
+def streak_metrics(name: str, slice_name: str) -> dict:
+    cal = slice_calendar_weeks.get(slice_name) or []
+    activity = weekly_activity.get(name, set())
+    active = [w in activity for w in cal]
+    active_count = sum(active)
+    max_run = run = 0
+    for a in active:
+        if a:
+            run += 1
+            max_run = max(max_run, run)
+        else:
+            run = 0
+    cur_run = 0
+    for a in reversed(active):
+        if a:
+            cur_run += 1
+        else:
+            break
+    return {
+        "active_weeks":   active_count,
+        "total_weeks":    len(cal),
+        "streak_longest": max_run,
+        "streak_current": cur_run,
+    }
+
 # ─── 10. Build the unified contributor records ────────────────────────────────
 # Reads pr_slices AFTER credit deltas have been applied (if enabled).
 
@@ -662,6 +758,8 @@ for name in all_names:
                 round(100 * pd["pr_credit_iterated"] / pd["pr_credit"], 1)
                 if pd["pr_credit"] >= ITERATION_MIN_PRS else None
             )
+        if SHOW_STREAK:
+            slice_rec.update(streak_metrics(name, s))
         record["slices"][s] = slice_rec
     contributors[name] = record
 
@@ -711,6 +809,8 @@ data = {
     "top_hotspots": top_hotspots,
     "show_iteration": SHOW_ITERATION,
     "show_similarity": SHOW_SIMILARITY,
+    "show_streak": SHOW_STREAK,
+    "slices": [{"code": code, "label": SLICE_LABELS[code]} for code in SLICES],
     "similarity_pairs": similarity_pairs,
     "credit_delta_enabled": CREDIT_DELTA_ENABLED,
     "credit_delta_cap": CREDIT_DELTA_CAP if CREDIT_DELTA_ENABLED else None,

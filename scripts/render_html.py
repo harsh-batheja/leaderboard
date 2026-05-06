@@ -151,11 +151,7 @@ HTML = r"""<!doctype html>
 
 <div class="controls">
   <span class="control-label">Time slice:</span>
-  <div class="toggle-group" id="sliceToggle">
-    <button data-slice="all" class="active">All-time</button>
-    <button data-slice="d30">Last 30 days</button>
-    <button data-slice="d7">Last 7 days</button>
-  </div>
+  <div class="toggle-group" id="sliceToggle"><!-- buttons rendered from DATA.slices --></div>
   <span class="control-label" style="margin-left: 16px;">Sort by:</span>
   <span style="font-size: 12px; color: var(--muted);">click any column header</span>
 </div>
@@ -187,6 +183,8 @@ HTML = r"""<!doctype html>
     <th data-sort="reviews">Reviews</th>
     <th></th>
     <th data-sort="iteration_rate" data-feature="iteration">Iteration</th>
+    <th data-sort="streak_longest" data-feature="streak">Streak</th>
+    <th data-sort="active_weeks"  data-feature="streak">Active Wks</th>
     <th data-sort="files">Files</th>
     <th>Activity (per week)</th>
   </tr></thead>
@@ -296,6 +294,23 @@ HTML = r"""<!doctype html>
   </div>
   </div>
 
+  <div data-feature="streak">
+  <h3>Streak and active weeks</h3>
+  <p>"Streak" is the longest run of consecutive ISO weeks within the current
+  slice where this contributor had any activity (commit, merged PR, or review).
+  The small "Nw · M now" hint shows the longest run plus the current ongoing
+  streak ending at this week. "Active Wks" is the absolute count: how many
+  weeks of the slice's calendar they were present at all, displayed as
+  <code>active / total</code>. For all-time, total starts at the repo's first
+  recorded activity.</p>
+  <div class="callout">
+    Streak rewards consistency, which is biased toward people in regular work
+    rhythms. Time off, parental leave, or focused multi-week deep work without
+    surface-level shipping all break the streak. Read this column as
+    "rhythm signal," not "commitment signal."
+  </div>
+  </div>
+
   <div data-feature="iteration">
   <h3>Optional: iteration-based credit delta</h3>
   <p>Off by default. When the build is run with <code>ITERATION_CREDIT_DELTA=1</code>
@@ -384,6 +399,7 @@ function hideDisabledFeatures() {
   const features = {
     iteration:  DATA.show_iteration,
     similarity: DATA.show_similarity,
+    streak:     DATA.show_streak,
   };
   for (const [name, enabled] of Object.entries(features)) {
     if (enabled) continue;
@@ -391,6 +407,17 @@ function hideDisabledFeatures() {
   }
 }
 hideDisabledFeatures();
+
+// Render slice toggle from DATA.slices (falls back to a sensible default if
+// the build didn't emit it).
+{
+  const slices = DATA.slices && DATA.slices.length ? DATA.slices : [
+    {code:"all",label:"All-time"},{code:"d30",label:"Last 30 days"},{code:"d7",label:"Last 7 days"},
+  ];
+  document.getElementById("sliceToggle").innerHTML = slices.map((s, i) =>
+    `<button data-slice="${s.code}"${i===0?' class="active"':''}>${s.label}</button>`
+  ).join("");
+}
 
 {
   const parts = [];
@@ -445,6 +472,10 @@ function getRows() {
       reviews: s.reviews,
       iteration_count: s.iteration_count ?? 0,
       iteration_rate:  s.iteration_rate,    // null when prs < threshold
+      streak_longest:  s.streak_longest ?? 0,
+      streak_current:  s.streak_current ?? 0,
+      active_weeks:    s.active_weeks ?? 0,
+      total_weeks:     s.total_weeks ?? 0,
       files: s.files,
       packages: r.packages,
       top_files: r.top_files,
@@ -544,6 +575,12 @@ function renderTable() {
     const cprCell = (r.commits_per_pr == null)
       ? `<span class="muted-num">—</span>`
       : r.commits_per_pr.toFixed(1);
+    const streakCell = r.streak_longest > 0
+      ? `${r.streak_longest}<span class="muted-num">w${r.streak_current ? ` · ${r.streak_current} now` : ""}</span>`
+      : `<span class="muted-num">—</span>`;
+    const activeCell = r.total_weeks > 0
+      ? `${r.active_weeks}<span class="muted-num">/${r.total_weeks}</span>`
+      : `<span class="muted-num">—</span>`;
     const iterTd = DATA.show_iteration
       ? `<td class="num">${iterCell}</td>`
       : "";
@@ -563,6 +600,7 @@ function renderTable() {
       <td class="num">${r.reviews}</td>
       <td class="bar-cell">${bar(r.reviews, maxR, "bar-r")}</td>
       ${iterTd}
+      ${DATA.show_streak ? `<td class="num">${streakCell}</td><td class="num">${activeCell}</td>` : ""}
       <td class="num muted-num">${r.files}</td>
       <td>${sparklineSVG(r.sparkline)}</td>
     `;
@@ -571,7 +609,7 @@ function renderTable() {
     // Detail row (collapsible)
     const detail = document.createElement("tr");
     detail.style.display = "none";
-    const colspan = DATA.show_iteration ? 17 : 16;
+    const colspan = 16 + (DATA.show_iteration ? 1 : 0) + (DATA.show_streak ? 2 : 0);
     detail.innerHTML = `<td colspan="${colspan}" style="padding: 0;"><div style="padding: 12px 32px;">${detailHTML(r)}</div></td>`;
     body.appendChild(detail);
   });
@@ -688,6 +726,18 @@ const STANDOUT_DEFS = {
     body:  r => `${r.iteration_rate}% iteration rate — lowest among contributors with ≥5 PRs.`,
     requires: "iteration",
   },
+  longest_streak: {
+    label: "Longest Streak",
+    pick:  rows => rows.slice().sort((a,b) => (b.streak_longest||0) - (a.streak_longest||0))[0],
+    body:  r => `${r.streak_longest}-week streak — longest run of consecutive active weeks in this slice.`,
+    requires: "streak",
+  },
+  most_active_weeks: {
+    label: "Most Active Weeks",
+    pick:  rows => rows.slice().sort((a,b) => (b.active_weeks||0) - (a.active_weeks||0))[0],
+    body:  r => `Active in ${r.active_weeks} of ${r.total_weeks} weeks in this slice.`,
+    requires: "streak",
+  },
 };
 
 function renderStandouts() {
@@ -697,10 +747,11 @@ function renderStandouts() {
     : ["top_impact","top_reviewer","highest_output","most_prs"];
   const seen  = new Set();
   const cards = [];
+  const featureFlags = { iteration: DATA.show_iteration, streak: DATA.show_streak };
   for (const code of config) {
     const def = STANDOUT_DEFS[code];
     if (!def) continue;
-    if (def.requires === "iteration" && !DATA.show_iteration) continue;
+    if (def.requires && !featureFlags[def.requires]) continue;
     const winner = def.pick(rows);
     if (!winner || seen.has(winner.name)) continue;
     seen.add(winner.name);
