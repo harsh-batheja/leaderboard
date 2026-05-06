@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Process all data sources into a JSON blob + render the HTML report."""
 
-import json, os, re, sys
+import json, math, os, re, sys
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -18,6 +18,17 @@ SHOW_ITERATION  = _flag("SHOW_ITERATION")    # per-author iteration column
 SHOW_SIMILARITY = _flag("SHOW_SIMILARITY")   # re-implementation suspects panel
 SHOW_STREAK     = _flag("SHOW_STREAK")       # per-author streak + active weeks columns
 SHOW_WEEKLY_CHART = _flag("SHOW_WEEKLY_CHART")    # stacked weekly contribution chart
+SHOW_REVIEW_IMPACT = _flag("SHOW_REVIEW_IMPACT")  # per-author review_impact column
+SHOW_COMPOSITE_IMPACT = _flag("SHOW_COMPOSITE_IMPACT")   # weighted_lines + α·review_impact
+WEIGHT_REVIEWS_BY_DEPTH = _flag("WEIGHT_REVIEWS_BY_DEPTH")  # depth-weight reviews
+
+# Reviewer credit shift: each non-self-author reviewer earns this fraction of
+# the PR's credit (and weighted_lines) — pulled away from the PR's authors.
+# Set to 0 to disable (default). Capped per-PR by REVIEWER_CREDIT_CAP.
+REVIEWER_CREDIT_RATE = float(os.environ.get("REVIEWER_CREDIT_RATE", "0"))
+REVIEWER_CREDIT_CAP  = float(os.environ.get("REVIEWER_CREDIT_CAP",  "0.3"))
+# Composite impact = weighted_lines + COMPOSITE_REVIEW_ALPHA × review_impact.
+COMPOSITE_REVIEW_ALPHA = float(os.environ.get("COMPOSITE_REVIEW_ALPHA", "0.1"))
 
 # Recover authorship lost at repo migration: if a PR was merged into a
 # predecessor repo and the imported codebase squashed everyone's work into
@@ -374,6 +385,11 @@ def empty_pr_stats():
 
 pr_slices = {s: defaultdict(empty_pr_stats) for s in SLICES}
 
+# Per-PR reviewer roster — captured during PR parsing, consumed after file
+# weights are derived for review_impact aggregation and the optional reviewer
+# credit shift. Each entry is (login, review_weight, ts, comments).
+pr_reviewers: dict[int, list] = {}
+
 # Per-PR record of who got credit and in which slices — needed to subtract
 # specific shares later when applying similarity-based credit shifts.
 pr_credit_log: dict[int, dict] = {}    # pr_number -> {"shares": {login: share}, "slices": [...]}
@@ -515,6 +531,7 @@ for pr in all_prs:
         }
 
     # Reviews
+    pr_reviewers_for_credit = []   # (login, weight, ts, comments) for credit shift later
     for review in pr.get("reviews", {}).get("nodes", []):
         if not review.get("author"):
             continue
@@ -529,9 +546,16 @@ for pr in all_prs:
             reviews_per_week[r_display][review_week] += 1
         if earliest_activity_ts is None or r_ts < earliest_activity_ts:
             earliest_activity_ts = r_ts
+        # review_weight: 1 by default; with depth weighting, 1 + ln(1 + comments)
+        comments = (review.get("comments") or {}).get("totalCount", 0) or 0
+        rw = (1 + math.log1p(comments)) if WEIGHT_REVIEWS_BY_DEPTH else 1
         for s in SLICES:
             if in_slice(r_ts, s):
-                pr_slices[s][r_login]["reviews"] += 1
+                pr_slices[s][r_login]["reviews"] += rw
+        pr_reviewers_for_credit.append((r_login, rw, r_ts, comments))
+
+    if pr_reviewers_for_credit:
+        pr_reviewers[pr["number"]] = pr_reviewers_for_credit
 
 print(f"Parsed PR data: {len(pr_slices['all'])} active gh logins all-time", file=sys.stderr)
 
@@ -628,6 +652,34 @@ for pr_num, info in pr_credit_log.items():
     else:
         eff = info["effective_author"]
         pr_weighted_by_login[pr_num][GH_TO_NAME.get(eff, eff)] = pr_total_w
+
+# Per-PR weighted total — used by reviewer credit / review impact below.
+pr_weighted_total: dict[int, float] = {}
+for pr_num, by_login in pr_weighted_by_login.items():
+    pr_weighted_total[pr_num] = sum(by_login.values())
+
+# ─── 4b. Review impact per slice ────────────────────────────────────────────
+# review_impact[slice][display_name] = sum over PRs reviewed of
+#   review_weight / total_review_weight × pr_weighted_total
+# A reviewer's "share" of a PR's impact is their depth-weighted slice of the
+# review attention that PR received. Always emitted (cheap); displayed only
+# when SHOW_REVIEW_IMPACT=1.
+review_impact_per_slice: dict = {s: defaultdict(float) for s in SLICES}
+# Per-PR per-reviewer attribution, kept for the credit-shift phase.
+pr_review_attribution: dict[int, dict[str, float]] = {}    # pr_num -> reviewer_login -> credit_share
+
+for pr_num, reviewers in pr_reviewers.items():
+    pr_w = pr_weighted_total.get(pr_num, 0)
+    if pr_w <= 0 or not reviewers:
+        continue
+    total_rw = sum(rw for _, rw, _, _ in reviewers) or 1
+    for r_login, rw, r_ts, _comments in reviewers:
+        share = rw / total_rw
+        pr_review_attribution.setdefault(pr_num, {})[r_login] = share
+        r_display = GH_TO_NAME.get(r_login, r_login)
+        for s in SLICES:
+            if in_slice(r_ts, s):
+                review_impact_per_slice[s][r_display] += share * pr_w
 
 # ─── 5. Per-author top files (all-time) ────────────────────────────────────────
 
@@ -868,6 +920,59 @@ else:
     print("Iteration credit delta: disabled (set ITERATION_CREDIT_DELTA=1 to enable, requires SHOW_ITERATION=1)",
           file=sys.stderr)
 
+# Reviewer credit shift: each non-self reviewer earns REVIEWER_CREDIT_RATE of
+# the PR's credit and weighted_lines, capped per-PR at REVIEWER_CREDIT_CAP.
+# Pulled proportionally from the PR's contributors (same pattern as iteration
+# delta). Default rate=0 means no shift.
+reviewer_delta_log = []
+if REVIEWER_CREDIT_RATE > 0:
+    for pr_num, attribution in pr_review_attribution.items():
+        log = pr_credit_log.get(pr_num)
+        if not log or not attribution:
+            continue
+        # Total fraction shifted to reviewers — capped.
+        per_review_shift = min(REVIEWER_CREDIT_RATE, REVIEWER_CREDIT_CAP)
+        total_shift = min(REVIEWER_CREDIT_CAP, per_review_shift * len(attribution))
+        # Each reviewer's slice of the total
+        reviewer_slices = {r: total_shift * share for r, share in attribution.items()}
+        # Each PR contributor loses pro-rata
+        applied = []
+        for r_login, r_share in reviewer_slices.items():
+            if r_login in BOTS:
+                continue
+            r_display = GH_TO_NAME.get(r_login, r_login)
+            for from_login, share in log["shares"].items():
+                if from_login == r_login or from_login in BOTS:
+                    continue
+                from_display = GH_TO_NAME.get(from_login, from_login)
+                amount   = share * r_share
+                amount_w = pr_weighted_by_login.get(pr_num, {}).get(from_display, 0) * r_share
+                if amount <= 0 and amount_w <= 0:
+                    continue
+                for s in log["slices"]:
+                    pr_slices[s][from_login]["pr_credit"]   -= amount
+                    pr_slices[s][r_login]["pr_credit"]      += amount
+                    if amount_w > 0:
+                        weighted_lines_per_slice[s][from_display] -= amount_w
+                        weighted_lines_per_slice[s][r_display]    += amount_w
+                applied.append({"from": from_login, "to": r_login,
+                                "amount": round(amount, 3),
+                                "weighted": round(amount_w, 1)})
+        if applied:
+            reviewer_delta_log.append({
+                "pr": pr_num,
+                "shift_pct": round(total_shift, 2),
+                "n_reviewers": len(attribution),
+                "applied":  applied,
+            })
+
+    print(f"Reviewer credit delta: applied {len(reviewer_delta_log)} PRs "
+          f"(rate {REVIEWER_CREDIT_RATE} per reviewer, cap {REVIEWER_CREDIT_CAP})",
+          file=sys.stderr)
+else:
+    print("Reviewer credit delta: disabled (set REVIEWER_CREDIT_RATE>0 to enable)",
+          file=sys.stderr)
+
 # ─── Calendar enumeration per slice ──────────────────────────────────────────
 # Always computed (used by both the per-slice sparkline and the optional
 # streak/active-weeks columns). Each entry is the ordered list of ISO week
@@ -959,8 +1064,14 @@ for name in all_names:
             "files": gd["files_touched"] if isinstance(gd["files_touched"], int) else len(gd["files_touched"]),
             "prs": round(pd["pr_credit"], 1),       # credit-weighted: split by commit-author share
             "prs_raw": pd["prs"],                    # # of PRs opened by this user
-            "reviews": pd["reviews"],
+            "reviews": round(pd["reviews"], 1) if isinstance(pd["reviews"], float) else pd["reviews"],
+            "review_impact": round(review_impact_per_slice[s].get(name, 0)),
         }
+        if SHOW_COMPOSITE_IMPACT:
+            slice_rec["composite_impact"] = round(
+                slice_rec["weighted_lines"] +
+                COMPOSITE_REVIEW_ALPHA * slice_rec["review_impact"]
+            )
         if SHOW_ITERATION:
             slice_rec["iteration_count"] = round(pd["pr_credit_iterated"], 1)
             slice_rec["iteration_rate"]  = (
@@ -1024,6 +1135,11 @@ data = {
     "show_similarity": SHOW_SIMILARITY,
     "show_streak": SHOW_STREAK,
     "show_weekly_chart": SHOW_WEEKLY_CHART,
+    "show_review_impact": SHOW_REVIEW_IMPACT,
+    "show_composite_impact": SHOW_COMPOSITE_IMPACT,
+    "weight_reviews_by_depth": WEIGHT_REVIEWS_BY_DEPTH,
+    "reviewer_credit_rate":   REVIEWER_CREDIT_RATE if REVIEWER_CREDIT_RATE > 0 else None,
+    "reviewer_delta_log":     reviewer_delta_log,
     "weekly_chart_metric": WEEKLY_CHART_METRIC if SHOW_WEEKLY_CHART else None,
     "weekly_chart_position": WEEKLY_CHART_POSITION if SHOW_WEEKLY_CHART else None,
     "weekly_chart_top_n": WEEKLY_CHART_TOP_N if SHOW_WEEKLY_CHART else None,

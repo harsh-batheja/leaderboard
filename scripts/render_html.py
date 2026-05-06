@@ -231,6 +231,8 @@ HTML = r"""<!doctype html>
     <th></th>
     <th data-sort="reviews">Reviews</th>
     <th></th>
+    <th data-sort="review_impact" data-feature="review_impact">Rev. Impact</th>
+    <th data-sort="composite_impact" data-feature="composite_impact">Impact*</th>
     <th data-sort="iteration_rate" data-feature="iteration">Iteration</th>
     <th data-sort="streak_longest" data-feature="streak">Streak</th>
     <th data-sort="active_weeks"  data-feature="streak">Active Wks</th>
@@ -319,6 +321,30 @@ HTML = r"""<!doctype html>
   in the bots list. Senior contributors often shift toward review and away from authoring;
   without this column, that work is invisible.</p>
 
+  <div data-feature="review_impact">
+  <h3>Reviewer Impact column</h3>
+  <p>For each PR a contributor reviewed, they earn a depth-weighted share of
+  the PR's hotspot-weighted impact. Specifically: each reviewer of a PR gets
+  <code>(their review_weight / sum_of_review_weights) × pr_weighted_total</code>.
+  <code>review_weight</code> is 1 by default, or
+  <code>1 + ln(1 + comment_count)</code> when <code>WEIGHT_REVIEWS_BY_DEPTH=1</code>
+  is set — diminishing-returns boost for substantive reviews.</p>
+  <div class="callout">
+    This column shows reviewer "ownership" of PRs they signed off on. It does
+    not subtract anything from the author's W. Lines — it's an additive view
+    of how much shipped impact a reviewer is behind. For a zero-sum version
+    that actually shifts credit, see the optional reviewer credit delta below.
+  </div>
+  </div>
+
+  <div data-feature="composite_impact">
+  <h3>Composite Impact column</h3>
+  <p>A single rolled-up score: <code>weighted_lines + α · review_impact</code>
+  with α defaulting to 0.1. Combines authoring and reviewing into one number.
+  Loses the bias-resistance of orthogonal columns — opt in only if your team
+  wants a single rank.</p>
+  </div>
+
   <h3>Commits and merge strategy (the C/PR column)</h3>
   <p>The "Commits" column counts post-merge git authors. Squash-merging
   collapses every PR into one commit (low ratio); rebase- or regular-merging
@@ -368,6 +394,19 @@ HTML = r"""<!doctype html>
     surface-level shipping all break the streak. Read this column as
     "rhythm signal," not "commitment signal."
   </div>
+  </div>
+
+  <h3>Optional: reviewer credit delta</h3>
+  <p>Off by default. When <code>REVIEWER_CREDIT_RATE</code> is set above 0
+  (e.g. 0.05), each non-self reviewer of a merged PR earns that fraction of
+  the PR's PR-credit and weighted_lines, shifted off the author(s) of the PR.
+  Capped per-PR at <code>REVIEWER_CREDIT_CAP</code> (default 0.3). Zero-sum;
+  the totals across contributors stay constant.</p>
+  <div class="callout">
+    Combine with <code>WEIGHT_REVIEWS_BY_DEPTH=1</code> to give heavier
+    reviews more shift. Long comment threads might be value or friction —
+    the system can't tell, so the multiplier is logarithmic
+    (<code>1 + ln(1 + comments)</code>) to bound the effect.
   </div>
 
   <div data-feature="iteration">
@@ -458,9 +497,11 @@ document.getElementById("genTime").textContent = new Date(DATA.generated_at).toL
 // data-feature="<name>"; we strip them before any render runs.
 function hideDisabledFeatures() {
   const features = {
-    iteration:  DATA.show_iteration,
-    similarity: DATA.show_similarity,
-    streak:     DATA.show_streak,
+    iteration:        DATA.show_iteration,
+    similarity:       DATA.show_similarity,
+    streak:           DATA.show_streak,
+    review_impact:    DATA.show_review_impact,
+    composite_impact: DATA.show_composite_impact,
   };
   for (const [name, enabled] of Object.entries(features)) {
     if (enabled) continue;
@@ -489,6 +530,10 @@ hideDisabledFeatures();
   if (DATA.iteration_delta_enabled) {
     const n = (DATA.iteration_delta_log || []).length;
     parts.push(`iteration (${n} fix${n===1?"":"es"})`);
+  }
+  if (DATA.reviewer_credit_rate) {
+    const n = (DATA.reviewer_delta_log || []).length;
+    parts.push(`reviewer ${(DATA.reviewer_credit_rate*100).toFixed(0)}% (${n} PR${n===1?"":"s"})`);
   }
   if (parts.length) {
     const badge = document.getElementById("creditDeltaBadge");
@@ -535,6 +580,8 @@ function getRows() {
       reviews: s.reviews,
       iteration_count: s.iteration_count ?? 0,
       iteration_rate:  s.iteration_rate,    // null when prs < threshold
+      review_impact:   s.review_impact ?? 0,
+      composite_impact: s.composite_impact ?? null,
       streak_longest:  s.streak_longest ?? 0,
       streak_current:  s.streak_current ?? 0,
       active_weeks:    s.active_weeks ?? 0,
@@ -648,6 +695,12 @@ function renderTable() {
     const iterTd = DATA.show_iteration
       ? `<td class="num">${iterCell}</td>`
       : "";
+    const reviewImpactTd = DATA.show_review_impact
+      ? `<td class="num">${fmt(r.review_impact)}</td>`
+      : "";
+    const compositeTd = DATA.show_composite_impact
+      ? `<td class="num">${r.composite_impact == null ? "—" : fmt(r.composite_impact)}</td>`
+      : "";
     tr.innerHTML = `
       <td class="name">${ghLink} <button class="expand-btn" data-name="${escape(r.name)}">▸</button></td>
       <td class="num">${fmt(r.weighted_lines)}</td>
@@ -663,6 +716,8 @@ function renderTable() {
       <td class="bar-cell">${bar(r.prs, maxP, "bar-p")}</td>
       <td class="num">${r.reviews}</td>
       <td class="bar-cell">${bar(r.reviews, maxR, "bar-r")}</td>
+      ${reviewImpactTd}
+      ${compositeTd}
       ${iterTd}
       ${DATA.show_streak ? `<td class="num">${streakCell}</td><td class="num">${activeCell}</td>` : ""}
       <td class="num muted-num">${r.files}</td>
@@ -673,7 +728,11 @@ function renderTable() {
     // Detail row (collapsible)
     const detail = document.createElement("tr");
     detail.style.display = "none";
-    const colspan = 16 + (DATA.show_iteration ? 1 : 0) + (DATA.show_streak ? 2 : 0);
+    const colspan = 16
+      + (DATA.show_iteration ? 1 : 0)
+      + (DATA.show_streak ? 2 : 0)
+      + (DATA.show_review_impact ? 1 : 0)
+      + (DATA.show_composite_impact ? 1 : 0);
     detail.innerHTML = `<td colspan="${colspan}" style="padding: 0;"><div style="padding: 12px 32px;">${detailHTML(r)}</div></td>`;
     body.appendChild(detail);
   });
@@ -802,6 +861,18 @@ const STANDOUT_DEFS = {
     body:  r => `Active in ${r.active_weeks} of ${r.total_weeks} weeks in this slice.`,
     requires: "streak",
   },
+  top_review_impact: {
+    label: "Top Reviewer Impact",
+    pick:  rows => rows.slice().sort((a,b) => (b.review_impact||0) - (a.review_impact||0))[0],
+    body:  r => `${fmt(r.review_impact)} weighted lines reviewed (depth-weighted share of every PR they reviewed).`,
+    requires: "review_impact",
+  },
+  top_composite: {
+    label: "Top Composite Impact",
+    pick:  rows => rows.slice().sort((a,b) => (b.composite_impact||0) - (a.composite_impact||0))[0],
+    body:  r => `${fmt(r.composite_impact)} composite (W. Lines + α·review impact).`,
+    requires: "composite_impact",
+  },
 };
 
 function renderStandouts() {
@@ -811,7 +882,12 @@ function renderStandouts() {
     : ["top_impact","top_reviewer","highest_output","most_prs"];
   const seen  = new Set();
   const cards = [];
-  const featureFlags = { iteration: DATA.show_iteration, streak: DATA.show_streak };
+  const featureFlags = {
+    iteration:        DATA.show_iteration,
+    streak:           DATA.show_streak,
+    review_impact:    DATA.show_review_impact,
+    composite_impact: DATA.show_composite_impact,
+  };
   for (const code of config) {
     const def = STANDOUT_DEFS[code];
     if (!def) continue;

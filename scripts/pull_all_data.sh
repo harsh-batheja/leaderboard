@@ -66,6 +66,7 @@ query(\$cursor: String) {
             author { login }
             state
             submittedAt
+            comments { totalCount }
           }
         }
       }
