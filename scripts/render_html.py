@@ -135,6 +135,16 @@ HTML = r"""<!doctype html>
 
   footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--border);
            color: var(--muted); font-size: 12px; }
+
+  .weekly-chart-wrap { background: var(--panel); border: 1px solid var(--border);
+                       border-radius: 8px; padding: 16px 20px; margin: 20px 0; }
+  .weekly-chart-title { font-size: 14px; color: var(--muted); margin-bottom: 8px;
+                        text-transform: uppercase; letter-spacing: 0.05em; }
+  .weekly-chart-svg { display: block; width: 100%; }
+  .weekly-chart-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px;
+                         font-size: 11px; color: var(--muted); }
+  .weekly-chart-legend i { display: inline-block; width: 9px; height: 9px;
+                           border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
 </style>
 </head>
 <body>
@@ -157,6 +167,8 @@ HTML = r"""<!doctype html>
 </div>
 
 <div class="stats" id="statsBar"></div>
+
+<div data-weekly-chart-anchor="before_leaderboard"></div>
 
 <h2>Combined Leaderboard</h2>
 <div class="legend">
@@ -191,6 +203,8 @@ HTML = r"""<!doctype html>
   <tbody id="leaderboardBody"></tbody>
 </table>
 
+<div data-weekly-chart-anchor="after_leaderboard"></div>
+
 <h2>Per-Package Distribution (all-time)</h2>
 <div class="legend" id="pkgLegend"></div>
 <table id="pkgTable">
@@ -203,8 +217,12 @@ HTML = r"""<!doctype html>
   <tbody id="pkgBody"></tbody>
 </table>
 
+<div data-weekly-chart-anchor="after_packages"></div>
+
 <h2>Standouts</h2>
 <div class="top-cards" id="standouts"></div>
+
+<div data-weekly-chart-anchor="after_standouts"></div>
 
 <h2>Hotspot Files (top 15 by churn)</h2>
 <div class="reasoning" style="padding: 16px 20px;">
@@ -213,6 +231,8 @@ HTML = r"""<!doctype html>
   <tbody id="hotspotsBody"></tbody>
 </table>
 </div>
+
+<div data-weekly-chart-anchor="after_hotspots"></div>
 
 <details style="margin-top: 24px;" data-feature="similarity">
   <summary style="cursor: pointer; font-size: 18px; padding: 8px 0; border-bottom: 1px solid var(--border); color: var(--text);">
@@ -770,6 +790,120 @@ function renderStandouts() {
   `).join("");
 }
 
+// Stacked weekly contribution chart. Reads metric / position / top_n from
+// DATA. Re-renders on slice change.
+const WEEKLY_PALETTE = [
+  "#58a6ff","#3fb950","#d2a8ff","#ffa657","#f85149","#79c0ff",
+  "#ff7b72","#a371f7","#56d364","#e3b341","#bc8cff","#7ee787",
+  "#8b949e",
+];
+const METRIC_LABELS = {
+  commits: "Commits", lines_added: "Lines added",
+  weighted_lines: "Weighted lines", prs: "PRs merged", reviews: "Reviews given",
+};
+
+function renderWeeklyChart() {
+  if (!DATA.show_weekly_chart) return;
+  const anchor = document.querySelector(`[data-weekly-chart-anchor="${DATA.weekly_chart_position}"]`);
+  if (!anchor) return;
+
+  const weeks = (DATA.slice_calendar_weeks || {})[currentSlice] || [];
+  if (!weeks.length) {
+    anchor.innerHTML = "";
+    return;
+  }
+
+  // Per-contributor totals across the slice → pick top N, sum the rest into "Others".
+  const TOP_N = DATA.weekly_chart_top_n || 10;
+  const totals = [];
+  for (const [name, r] of Object.entries(DATA.contributors)) {
+    const arr = r.slices[currentSlice].weekly_metric || [];
+    const sum = arr.reduce((a,b) => a+b, 0);
+    if (sum > 0) totals.push({ name, arr, sum });
+  }
+  totals.sort((a,b) => b.sum - a.sum);
+  const top = totals.slice(0, TOP_N);
+  const rest = totals.slice(TOP_N);
+  if (rest.length) {
+    const restArr = weeks.map((_, i) => rest.reduce((s, c) => s + (c.arr[i] || 0), 0));
+    if (restArr.some(v => v > 0)) {
+      top.push({ name: `+${rest.length} others`, arr: restArr, sum: rest.reduce((s,c)=>s+c.sum,0) });
+    }
+  }
+
+  // Empty? Bail with a friendly note.
+  const grandTotal = top.reduce((s,c) => s + c.sum, 0);
+  if (grandTotal === 0) {
+    anchor.innerHTML = `<div class="weekly-chart-wrap"><div class="weekly-chart-title">${escape(METRIC_LABELS[DATA.weekly_chart_metric] || DATA.weekly_chart_metric)} per week</div><div class="muted-num" style="font-size:12px;">No activity in this slice.</div></div>`;
+    return;
+  }
+
+  // Layout
+  const W = 1280, H = 320;
+  const padL = 50, padR = 12, padT = 12, padB = 28;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const colW = innerW / weeks.length;
+  const barW = Math.max(2, colW * 0.78);
+
+  // Per-week stacked totals — find max for y scale.
+  const weekTotals = weeks.map((_, i) => top.reduce((s,c) => s + (c.arr[i] || 0), 0));
+  const maxY = Math.max(...weekTotals, 1);
+
+  // Y-axis ticks: 4 horizontal grid lines.
+  const ticks = [];
+  for (let t = 0; t <= 4; t++) {
+    const v = (maxY * t / 4);
+    const y = padT + innerH - (v / maxY) * innerH;
+    ticks.push({ y, label: v >= 1000 ? (v/1000).toFixed(1)+"k" : Math.round(v) });
+  }
+
+  // Render stacked bars.
+  const bars = [];
+  weeks.forEach((wk, i) => {
+    let stackTop = padT + innerH;
+    top.forEach((c, ci) => {
+      const v = c.arr[i] || 0;
+      if (!v) return;
+      const h = (v / maxY) * innerH;
+      const x = padL + i * colW + (colW - barW) / 2;
+      const y = stackTop - h;
+      stackTop = y;
+      const color = WEEKLY_PALETTE[ci % WEEKLY_PALETTE.length];
+      bars.push(`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${color}"><title>${escape(c.name)} · ${escape(wk)} · ${v}</title></rect>`);
+    });
+  });
+
+  // X-axis labels: thin out if many weeks.
+  const labelEvery = weeks.length > 26 ? 4 : weeks.length > 13 ? 2 : 1;
+  const xLabels = weeks.map((wk, i) => {
+    if (i % labelEvery !== 0 && i !== weeks.length - 1) return "";
+    const x = padL + i * colW + colW / 2;
+    return `<text x="${x.toFixed(1)}" y="${(H - 8).toFixed(1)}" font-size="10" fill="var(--muted)" text-anchor="middle">${escape(wk.replace("2026-",""))}</text>`;
+  }).join("");
+
+  const yLabels = ticks.map(t =>
+    `<line x1="${padL}" x2="${padL+innerW}" y1="${t.y.toFixed(1)}" y2="${t.y.toFixed(1)}" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2,3"/>` +
+    `<text x="${padL-6}" y="${(t.y+3).toFixed(1)}" font-size="10" fill="var(--muted)" text-anchor="end">${t.label}</text>`
+  ).join("");
+
+  const legend = top.map((c, ci) =>
+    `<span><i style="background:${WEEKLY_PALETTE[ci % WEEKLY_PALETTE.length]}"></i>${escape(c.name)}</span>`
+  ).join("");
+
+  const sliceMeta = (DATA.slices || []).find(s => s.code === currentSlice);
+  const sliceLabel = sliceMeta ? sliceMeta.label : currentSlice;
+  anchor.innerHTML = `
+    <div class="weekly-chart-wrap">
+      <div class="weekly-chart-title">${escape(METRIC_LABELS[DATA.weekly_chart_metric] || DATA.weekly_chart_metric)} per week — ${escape(sliceLabel)}</div>
+      <svg class="weekly-chart-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+        ${yLabels}
+        ${bars.join("")}
+        ${xLabels}
+      </svg>
+      <div class="weekly-chart-legend">${legend}</div>
+    </div>`;
+}
+
 function renderHotspots() {
   $("#hotspotsBody").innerHTML = DATA.top_hotspots.map(h =>
     `<tr><td class="name" style="font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;">${escape(h.path)}</td>
@@ -810,7 +944,7 @@ $$("#sliceToggle button").forEach(b => {
     $$("#sliceToggle button").forEach(x => x.classList.remove("active"));
     b.classList.add("active");
     currentSlice = b.dataset.slice;
-    renderStats(); renderTable(); renderStandouts();
+    renderStats(); renderTable(); renderStandouts(); renderWeeklyChart();
   });
 });
 
@@ -834,6 +968,7 @@ renderPackageTable();
 renderStandouts();
 renderHotspots();
 renderSimilarity();
+renderWeeklyChart();
 </script>
 </body>
 </html>

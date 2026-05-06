@@ -17,6 +17,14 @@ def _flag(name: str) -> bool:
 SHOW_ITERATION  = _flag("SHOW_ITERATION")    # per-author iteration column
 SHOW_SIMILARITY = _flag("SHOW_SIMILARITY")   # re-implementation suspects panel
 SHOW_STREAK     = _flag("SHOW_STREAK")       # per-author streak + active weeks columns
+SHOW_WEEKLY_CHART = _flag("SHOW_WEEKLY_CHART")    # stacked weekly contribution chart
+
+# Weekly chart configuration (only consumed if SHOW_WEEKLY_CHART is on).
+WEEKLY_CHART_METRIC = os.environ.get("WEEKLY_CHART_METRIC", "weighted_lines")
+# valid: commits | lines_added | weighted_lines | prs | reviews
+WEEKLY_CHART_POSITION = os.environ.get("WEEKLY_CHART_POSITION", "before_leaderboard")
+# valid: before_leaderboard | after_leaderboard | after_packages | after_standouts | after_hotspots
+WEEKLY_CHART_TOP_N = int(os.environ.get("WEEKLY_CHART_TOP_N", "10"))
 
 # Extra time slices to include in the toggle. Comma-separated codes from:
 #   q90  = last 90 days   (quarter)
@@ -115,6 +123,16 @@ weeks_seen = set()
 weekly_activity: dict[str, set[str]] = defaultdict(set)
 earliest_activity_ts: datetime | None = None
 
+# Per-week per-author counters for the optional weekly chart. Keyed by
+# display-name to match the contributor record.
+lines_added_per_week:    dict = defaultdict(lambda: defaultdict(int))    # name -> week -> add
+prs_per_week:            dict = defaultdict(lambda: defaultdict(int))    # name -> week -> count
+reviews_per_week:        dict = defaultdict(lambda: defaultdict(int))    # name -> week -> count
+# Per-week per-author per-file lines, used to compute weighted_lines per week
+# AFTER hotspot weights are derived (we don't have weights yet at commit-parse).
+file_lines_per_week:     dict = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+# name -> week -> file -> add
+
 # Parse the raw git log
 current_author = None
 current_ts = None
@@ -160,6 +178,10 @@ with open(DATA_DIR / "commits_numstat.tsv") as f:
                 # All-time per-file per-author tracking
                 per_file_author_add[path][current_author] += add
                 per_author_file_add[current_author][path] += add
+                # Per-week per-author tracking (for the weekly chart, when on)
+                if SHOW_WEEKLY_CHART:
+                    lines_added_per_week[current_author][week] += add
+                    file_lines_per_week[current_author][week][path] += add
 
 # Convert sets to counts before serializing
 for s in slices_data:
@@ -368,6 +390,8 @@ for pr in all_prs:
     merge_week = merged_at.strftime("%Y-W%V")
     pr_display = GH_TO_NAME.get(pr_author_login, pr_author_login)
     weekly_activity[pr_display].add(merge_week)
+    if SHOW_WEEKLY_CHART:
+        prs_per_week[pr_display][merge_week] += 1
     if earliest_activity_ts is None or merged_at < earliest_activity_ts:
         earliest_activity_ts = merged_at
 
@@ -405,7 +429,10 @@ for pr in all_prs:
             continue
         r_ts = datetime.fromisoformat(review["submittedAt"].replace("Z", "+00:00")) if review.get("submittedAt") else merged_at
         review_week = r_ts.strftime("%Y-W%V")
-        weekly_activity[GH_TO_NAME.get(r_login, r_login)].add(review_week)
+        r_display = GH_TO_NAME.get(r_login, r_login)
+        weekly_activity[r_display].add(review_week)
+        if SHOW_WEEKLY_CHART:
+            reviews_per_week[r_display][review_week] += 1
         if earliest_activity_ts is None or r_ts < earliest_activity_ts:
             earliest_activity_ts = r_ts
         for s in SLICES:
@@ -454,6 +481,29 @@ for s, by_author in per_author_file_add_slice.items():
     for name, files in by_author.items():
         for path, add in files.items():
             weighted_lines_per_slice[s][name] += add * file_weight.get(path, 1.0)
+
+# Per-week per-author weighted lines, computed now that hotspot weights exist.
+weighted_lines_per_week: dict = defaultdict(lambda: defaultdict(float))
+if SHOW_WEEKLY_CHART:
+    for name, weeks_d in file_lines_per_week.items():
+        for week, files in weeks_d.items():
+            for path, add in files.items():
+                weighted_lines_per_week[name][week] += add * file_weight.get(path, 1.0)
+    # Free the per-file detail; we only needed it to derive weighted_lines_per_week.
+    file_lines_per_week.clear()
+
+def weekly_metric_value(name: str, week: str) -> float:
+    if WEEKLY_CHART_METRIC == "commits":
+        return commits_per_week[name].get(week, 0)
+    if WEEKLY_CHART_METRIC == "lines_added":
+        return lines_added_per_week[name].get(week, 0)
+    if WEEKLY_CHART_METRIC == "weighted_lines":
+        return weighted_lines_per_week[name].get(week, 0)
+    if WEEKLY_CHART_METRIC == "prs":
+        return prs_per_week[name].get(week, 0)
+    if WEEKLY_CHART_METRIC == "reviews":
+        return reviews_per_week[name].get(week, 0)
+    return 0
 
 # ─── 5. Per-author top files (all-time) ────────────────────────────────────────
 
@@ -760,6 +810,9 @@ for name in all_names:
             ),
             "weighted_lines": round(weighted_lines_per_slice[s].get(name, 0)),
             "sparkline": [commits_per_week[name].get(w, 0) for w in slice_calendar_weeks[s]],
+            "weekly_metric": ([round(weekly_metric_value(name, w), 1)
+                               for w in slice_calendar_weeks[s]]
+                              if SHOW_WEEKLY_CHART else None),
             "add": gd["add"],
             "del": gd["del"],
             "net": gd["add"] - gd["del"],
@@ -826,6 +879,11 @@ data = {
     "show_iteration": SHOW_ITERATION,
     "show_similarity": SHOW_SIMILARITY,
     "show_streak": SHOW_STREAK,
+    "show_weekly_chart": SHOW_WEEKLY_CHART,
+    "weekly_chart_metric": WEEKLY_CHART_METRIC if SHOW_WEEKLY_CHART else None,
+    "weekly_chart_position": WEEKLY_CHART_POSITION if SHOW_WEEKLY_CHART else None,
+    "weekly_chart_top_n": WEEKLY_CHART_TOP_N if SHOW_WEEKLY_CHART else None,
+    "slice_calendar_weeks": slice_calendar_weeks if SHOW_WEEKLY_CHART else None,
     "slices": [{"code": code, "label": SLICE_LABELS[code]} for code in SLICES],
     "similarity_pairs": similarity_pairs,
     "credit_delta_enabled": CREDIT_DELTA_ENABLED,
