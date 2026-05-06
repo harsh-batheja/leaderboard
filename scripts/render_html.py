@@ -918,7 +918,7 @@ function renderWeeklyChart() {
   const xLabels = weeks.map((wk, i) => {
     if (i % labelEvery !== 0 && i !== weeks.length - 1) return "";
     const x = padL + i * colW + colW / 2;
-    return `<text x="${x.toFixed(1)}" y="${(H - 8).toFixed(1)}" font-size="10" fill="var(--muted)" text-anchor="middle">${escape(wk.replace("2026-",""))}</text>`;
+    return `<text x="${x.toFixed(1)}" y="${(H - 8).toFixed(1)}" font-size="10" fill="var(--muted)" text-anchor="middle">${escape(wk.replace(/^\d{4}-/,""))}</text>`;
   }).join("");
 
   const yLabels = ticks.map(t =>
@@ -1038,7 +1038,7 @@ function renderTimeSeriesChart(values, weekLabels, color) {
   const xLabels = weekLabels.map((wk, i) => {
     if (i % labelEvery !== 0 && i !== weekLabels.length - 1) return "";
     const x = padL + i * colW + colW / 2;
-    return `<text x="${x.toFixed(1)}" y="${(H - 6).toFixed(1)}" font-size="10" fill="var(--muted)" text-anchor="middle">${escape((wk||"").replace("2026-",""))}</text>`;
+    return `<text x="${x.toFixed(1)}" y="${(H - 6).toFixed(1)}" font-size="10" fill="var(--muted)" text-anchor="middle">${escape((wk||"").replace(/^\d{4}-/,""))}</text>`;
   }).join("");
   return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;width:100%;">${ticks.join("")}${bars}${xLabels}</svg>`;
 }
@@ -1063,24 +1063,31 @@ function renderDetail(login) {
 
   const all = r.slices.all || {};
   const d30 = r.slices.d30 || {};
-  const d60 = r.slices.d60 || d30;
-  // Period-over-period deltas: last 30 vs the 30 before that.
-  const prev30 = {
+  // Period-over-period delta needs the 30 days BEFORE last 30 — we derive that
+  // from d60. If d60 isn't enabled (EXTRA_SLICES doesn't include it) we omit
+  // the comparison entirely instead of silently zeroing out and showing "—".
+  const d60 = r.slices.d60;
+  const prev30 = d60 ? {
     weighted_lines: Math.max(0, (d60.weighted_lines || 0) - (d30.weighted_lines || 0)),
     prs:            Math.max(0, (d60.prs || 0) - (d30.prs || 0)),
     commits:        Math.max(0, (d60.commits || 0) - (d30.commits || 0)),
     reviews:        Math.max(0, (d60.reviews || 0) - (d30.reviews || 0)),
-  };
+  } : null;
 
   function tickerHtml(label, value, deltaP) {
-    let deltaStr = "—", cls = "flat";
-    if (deltaP != null && isFinite(deltaP)) {
+    let deltaStr, cls = "flat";
+    if (deltaP == null) {
+      deltaStr = "";        // delta unavailable — render the ticker without a delta line
+    } else if (!isFinite(deltaP)) {
+      deltaStr = "—";
+    } else {
       cls = deltaP > 1 ? "up" : deltaP < -1 ? "down" : "flat";
       deltaStr = `${deltaP >= 0 ? "+" : ""}${deltaP.toFixed(1)}% vs prior 30d`;
     }
+    const deltaLine = deltaStr ? `<div class="ticker-delta ${cls}">${escape(deltaStr)}</div>` : "";
     return `<div class="ticker"><div class="ticker-label">${escape(label)}</div>
               <div class="ticker-value">${value}</div>
-              <div class="ticker-delta ${cls}">${escape(deltaStr)}</div></div>`;
+              ${deltaLine}</div>`;
   }
 
   const slicesToShow = (DATA.slices || []).map(s => s.code);
@@ -1119,10 +1126,10 @@ function renderDetail(login) {
     </div>
 
     <div class="detail-tickers">
-      ${tickerHtml("Weighted lines", fmt(all.weighted_lines || 0), deltaPct(d30.weighted_lines || 0, prev30.weighted_lines))}
-      ${tickerHtml("PRs (credit)", fmt(all.prs || 0), deltaPct(d30.prs || 0, prev30.prs))}
-      ${tickerHtml("Commits", fmt(all.commits || 0), deltaPct(d30.commits || 0, prev30.commits))}
-      ${tickerHtml("Reviews", fmt(all.reviews || 0), deltaPct(d30.reviews || 0, prev30.reviews))}
+      ${tickerHtml("Weighted lines", fmt(all.weighted_lines || 0), prev30 && deltaPct(d30.weighted_lines || 0, prev30.weighted_lines))}
+      ${tickerHtml("PRs (credit)", fmt(all.prs || 0), prev30 && deltaPct(d30.prs || 0, prev30.prs))}
+      ${tickerHtml("Commits", fmt(all.commits || 0), prev30 && deltaPct(d30.commits || 0, prev30.commits))}
+      ${tickerHtml("Reviews", fmt(all.reviews || 0), prev30 && deltaPct(d30.reviews || 0, prev30.reviews))}
       ${tickerHtml("Files touched", fmt(all.files || 0), null)}
       ${all.streak_longest != null ? tickerHtml("Streak", `${all.streak_longest}w`, null) : ""}
     </div>

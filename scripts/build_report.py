@@ -144,6 +144,30 @@ reviews_per_week:        dict = defaultdict(lambda: defaultdict(int))    # name 
 file_lines_per_week:     dict = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 # name -> week -> file -> add
 
+# Identify the migration-root SHA (the chronologically OLDEST commit with no
+# parent) so we can skip it when INCLUDE_PREHISTORY_PRS is on. Skipping every
+# orphan would silently zero out unrelated branches that were grafted later.
+migration_root_sha: str | None = None
+if INCLUDE_PREHISTORY_PRS:
+    earliest_orphan_ts = None
+    with open(DATA_DIR / "commits_numstat.tsv") as f:
+        for line in f:
+            if not line.startswith("COMMIT\t"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 5:
+                continue
+            sha, ts_str, _author, parents = parts[1], parts[2], parts[3], parts[4]
+            if parents.strip():        # has at least one parent — not orphan
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str)
+            except ValueError:
+                continue
+            if earliest_orphan_ts is None or ts < earliest_orphan_ts:
+                earliest_orphan_ts = ts
+                migration_root_sha = sha
+
 # Parse the raw git log
 current_author = None
 current_ts = None
@@ -158,19 +182,19 @@ with open(DATA_DIR / "commits_numstat.tsv") as f:
             current_sha = parts[1]
             current_ts = datetime.fromisoformat(parts[2])
             current_author = parts[3]
-            parent_shas = parts[4] if len(parts) > 4 else ""
             # Skip the migration root commit when pre-history PR recovery is on.
             # Its 80K+ lines would double-count: pre-history PRs already credit
-            # those lines to their actual authors via PR data.
-            if INCLUDE_PREHISTORY_PRS and not parent_shas.strip():
-                print(f"Skipping root commit {current_sha[:8]} ({current_author}): "
+            # those lines to their actual authors via PR data. We only skip the
+            # one true migration root (oldest orphan), not every orphan.
+            if INCLUDE_PREHISTORY_PRS and current_sha == migration_root_sha:
+                print(f"Skipping migration root {current_sha[:8]} ({current_author}): "
                       f"its lines are credited via pre-history PRs", file=sys.stderr)
                 current_author = None
                 continue
             if current_author in BOTS:
                 current_author = None
                 continue
-            week = current_ts.strftime("%Y-W%V")
+            week = current_ts.strftime("%G-W%V")
             weeks_seen.add(week)
             commits_per_week[current_author][week] += 1
             weekly_activity[current_author].add(week)
@@ -415,7 +439,7 @@ for pr in all_prs:
         pr_nodes = pr_file_nodes.get(pr["number"], [])
         pr_total_add = pr.get("additions", 0) or 0
         pr_total_del = pr.get("deletions", 0) or 0
-        week_of_merge = merged_at.strftime("%Y-W%V")
+        week_of_merge = merged_at.strftime("%G-W%V")
         for u, share in shares.items():
             if u in BOTS:
                 continue
@@ -452,7 +476,7 @@ for pr in all_prs:
     # Track activity for streak/active-weeks (keyed by display name to match
     # the contributor record). Counts each PR-author and reviewer for the week
     # of the merge / review.
-    merge_week = merged_at.strftime("%Y-W%V")
+    merge_week = merged_at.strftime("%G-W%V")
     pr_display = GH_TO_NAME.get(pr_author_login, pr_author_login)
     weekly_activity[pr_display].add(merge_week)
     if SHOW_WEEKLY_CHART:
@@ -498,7 +522,7 @@ for pr in all_prs:
         if r_login in BOTS or r_login == pr_author_login:  # don't count self-reviews
             continue
         r_ts = datetime.fromisoformat(review["submittedAt"].replace("Z", "+00:00")) if review.get("submittedAt") else merged_at
-        review_week = r_ts.strftime("%Y-W%V")
+        review_week = r_ts.strftime("%G-W%V")
         r_display = GH_TO_NAME.get(r_login, r_login)
         weekly_activity[r_display].add(review_week)
         if SHOW_WEEKLY_CHART:
@@ -580,6 +604,12 @@ def weekly_metric_value(name: str, week: str) -> float:
 # we attribute the whole PR's weighted lines to the squash author (where git
 # log actually puts them); for pre-history PRs we use the per-commit-author
 # share (consistent with how lines were credited via PR data above).
+#
+# Keys are stored as DISPLAY NAMES so the values can be subtracted from
+# weighted_lines_per_slice (also keyed by display) without an extra mapping
+# step at shift time. This avoids a bug where a contributor missing from
+# IDENTITIES_FILE had their weighted_lines stranded under the gh-login key
+# while the slice dict held them under their git-author display name.
 pr_weighted_by_login: dict = defaultdict(dict)
 for pr_num, info in pr_credit_log.items():
     nodes = pr_file_nodes.get(pr_num, [])
@@ -594,9 +624,10 @@ for pr_num, info in pr_credit_log.items():
     if info.get("is_prehistory"):
         for login, share in info["shares"].items():
             if share > 0:
-                pr_weighted_by_login[pr_num][login] = share * pr_total_w
+                pr_weighted_by_login[pr_num][GH_TO_NAME.get(login, login)] = share * pr_total_w
     else:
-        pr_weighted_by_login[pr_num][info["effective_author"]] = pr_total_w
+        eff = info["effective_author"]
+        pr_weighted_by_login[pr_num][GH_TO_NAME.get(eff, eff)] = pr_total_w
 
 # ─── 5. Per-author top files (all-time) ────────────────────────────────────────
 
@@ -750,8 +781,8 @@ if CREDIT_DELTA_ENABLED:
             if from_login == to_login or from_login in BOTS:
                 continue
             amount   = share * shift_pct
-            amount_w = pr_weighted_by_login.get(m_num, {}).get(from_login, 0) * shift_pct
             from_display = GH_TO_NAME.get(from_login, from_login)
+            amount_w = pr_weighted_by_login.get(m_num, {}).get(from_display, 0) * shift_pct
             if amount <= 0 and amount_w <= 0:
                 continue
             for s in log["slices"]:
@@ -808,8 +839,8 @@ if ITERATION_CREDIT_DELTA:
                 if from_login == q_author or from_login in BOTS:
                     continue
                 amount   = share * shift
-                amount_w = pr_weighted_by_login.get(p_num, {}).get(from_login, 0) * shift
                 from_display = GH_TO_NAME.get(from_login, from_login)
+                amount_w = pr_weighted_by_login.get(p_num, {}).get(from_display, 0) * shift
                 if amount <= 0 and amount_w <= 0:
                     continue
                 for s in log["slices"]:
@@ -850,7 +881,7 @@ for s, delta in SLICES.items():
     seen_w: set[str] = set()
     cur = start
     while cur <= NOW:
-        wk = cur.strftime("%Y-W%V")
+        wk = cur.strftime("%G-W%V")
         if wk not in seen_w:
             seen_w.add(wk)
             weeks.append(wk)
@@ -950,15 +981,19 @@ print(f"Final contributors: {len(contributors)}", file=sys.stderr)
 
 totals = {}
 for s in SLICES:
-    t = {"commits": 0, "add": 0, "prs": 0, "reviews": 0, "people": 0}
+    t = {"commits": 0, "add": 0, "prs": 0.0, "reviews": 0, "people": 0}
     for r in contributors.values():
         sl = r["slices"][s]
         t["commits"] += sl["commits"]
         t["add"] += sl["add"]
-        t["prs"] += sl.get("prs_raw", 0)
+        # Sum credit-weighted PR count to match the PRs column underneath.
+        # Credit deltas redistribute among non-bot contributors so the total
+        # remains close to the raw PR count, but the unit now matches the row.
+        t["prs"] += sl.get("prs", 0)
         t["reviews"] += sl["reviews"]
         if sl["commits"] or sl["add"] or sl["prs"] or sl["reviews"]:
             t["people"] += 1
+    t["prs"] = round(t["prs"], 1)
     totals[s] = t
 
 REPO_OWNER = os.environ.get("REPO_OWNER", "")
