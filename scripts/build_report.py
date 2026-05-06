@@ -101,6 +101,10 @@ slices_data = {s: defaultdict(empty_stats) for s in SLICES}
 per_file_author_add = defaultdict(lambda: defaultdict(int))  # file -> name -> add
 per_author_file_add = defaultdict(lambda: defaultdict(int))  # name -> file -> add
 
+# Same, but bucketed per time slice so the W. Lines column can be slice-aware.
+# slice_name -> name -> file -> add
+per_author_file_add_slice = {s: defaultdict(lambda: defaultdict(int)) for s in SLICES}
+
 # Commits per week per author (for sparkline)
 commits_per_week = defaultdict(lambda: defaultdict(int))  # name -> iso-week -> count
 weeks_seen = set()
@@ -151,6 +155,7 @@ with open(DATA_DIR / "commits_numstat.tsv") as f:
                         slices_data[s][current_author]["add"] += add
                         slices_data[s][current_author]["del"] += dele
                         slices_data[s][current_author]["files_touched"].add(path)
+                        per_author_file_add_slice[s][current_author][path] += add
                 # All-time per-file per-author tracking
                 per_file_author_add[path][current_author] += add
                 per_author_file_add[current_author][path] += add
@@ -433,12 +438,21 @@ for i, (path, _) in enumerate(sorted_files):
 
 print(f"Hotspot weights computed for {len(file_weight)} files", file=sys.stderr)
 
-# ─── 4. Per-author weighted lines (all-time) ──────────────────────────────────
+# ─── 4. Per-author weighted lines (all-time + per slice) ──────────────────────
 
 weighted_lines = defaultdict(float)
 for name, files in per_author_file_add.items():
     for path, add in files.items():
         weighted_lines[name] += add * file_weight.get(path, 1.0)
+
+# Per-slice version: same hotspot weights (which are inherently all-time —
+# file importance shouldn't shift with the time window), applied to lines
+# added inside the slice.
+weighted_lines_per_slice: dict = {s: defaultdict(float) for s in SLICES}
+for s, by_author in per_author_file_add_slice.items():
+    for name, files in by_author.items():
+        for path, add in files.items():
+            weighted_lines_per_slice[s][name] += add * file_weight.get(path, 1.0)
 
 # ─── 5. Per-author top files (all-time) ────────────────────────────────────────
 
@@ -744,6 +758,7 @@ for name in all_names:
                 round(gd["commits"] / pd["prs"], 1)
                 if pd["prs"] > 0 else None
             ),
+            "weighted_lines": round(weighted_lines_per_slice[s].get(name, 0)),
             "add": gd["add"],
             "del": gd["del"],
             "net": gd["add"] - gd["del"],

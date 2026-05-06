@@ -250,9 +250,11 @@ HTML = r"""<!doctype html>
   <h3>Hotspot-weighted lines</h3>
   <p>A 100-line change to a frequently-edited core file is structurally more important than
   a 5,000-line change to a generated snapshot or a one-off doc. Each file is assigned a weight
-  (0.5×–2.0×) based on its all-time commit count percentile; high-churn files (the ones the
-  project actually edits often) weight more. The "W. Lines" column is the resulting
-  hotspot-weighted sum.</p>
+  (0.5×–2.0×) based on its <em>all-time</em> commit count percentile; high-churn files (the ones the
+  project actually edits often) weight more. The "W. Lines" column is the slice-aware sum:
+  lines added <em>in the selected slice</em> multiplied by the file's all-time hotspot weight.
+  The hotspot weights are intentionally not slice-aware — file importance shouldn't shift just
+  because you switched the toggle.</p>
 
   <h3>Reviews as a 4th dimension</h3>
   <p>Reviews <em>given</em> are a separate signal from reviews <em>received</em>. This column counts
@@ -462,7 +464,9 @@ function getRows() {
     return {
       name,
       ghLogin: r.ghLogin,
-      weighted_lines: r.weighted_lines,
+      // Slice-aware weighted lines — falls back to all-time for older builds
+      // that didn't emit s.weighted_lines.
+      weighted_lines: (s.weighted_lines != null) ? s.weighted_lines : r.weighted_lines,
       commits: s.commits,
       commits_per_pr: s.commits_per_pr,
       add: s.add,
