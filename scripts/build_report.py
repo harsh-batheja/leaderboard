@@ -19,6 +19,14 @@ SHOW_SIMILARITY = _flag("SHOW_SIMILARITY")   # re-implementation suspects panel
 SHOW_STREAK     = _flag("SHOW_STREAK")       # per-author streak + active weeks columns
 SHOW_WEEKLY_CHART = _flag("SHOW_WEEKLY_CHART")    # stacked weekly contribution chart
 
+# Recover authorship lost at repo migration: if a PR was merged into a
+# predecessor repo and the imported codebase squashed everyone's work into
+# a single root commit, the rightful authors are unrecoverable from git
+# alone. When this is on, lines/weighted-lines/files for PRs merged BEFORE
+# the repo's first commit are credited via PR data (additions, files, and
+# commit-author shares) instead. Default off because it changes semantics.
+INCLUDE_PREHISTORY_PRS = _flag("INCLUDE_PREHISTORY_PRS")
+
 # Weekly chart configuration (only consumed if SHOW_WEEKLY_CHART is on).
 WEEKLY_CHART_METRIC = os.environ.get("WEEKLY_CHART_METRIC", "weighted_lines")
 # valid: commits | lines_added | weighted_lines | prs | reviews
@@ -122,6 +130,9 @@ weeks_seen = set()
 # review). Used by the optional streak/active-weeks columns.
 weekly_activity: dict[str, set[str]] = defaultdict(set)
 earliest_activity_ts: datetime | None = None
+# Earliest git commit timestamp on main — anchors the cutoff for "pre-history"
+# PR detection. Set during commit parsing.
+first_main_commit_ts: datetime | None = None
 
 # Per-week per-author counters for the optional weekly chart. Keyed by
 # display-name to match the contributor record.
@@ -147,6 +158,15 @@ with open(DATA_DIR / "commits_numstat.tsv") as f:
             current_sha = parts[1]
             current_ts = datetime.fromisoformat(parts[2])
             current_author = parts[3]
+            parent_shas = parts[4] if len(parts) > 4 else ""
+            # Skip the migration root commit when pre-history PR recovery is on.
+            # Its 80K+ lines would double-count: pre-history PRs already credit
+            # those lines to their actual authors via PR data.
+            if INCLUDE_PREHISTORY_PRS and not parent_shas.strip():
+                print(f"Skipping root commit {current_sha[:8]} ({current_author}): "
+                      f"its lines are credited via pre-history PRs", file=sys.stderr)
+                current_author = None
+                continue
             if current_author in BOTS:
                 current_author = None
                 continue
@@ -156,6 +176,8 @@ with open(DATA_DIR / "commits_numstat.tsv") as f:
             weekly_activity[current_author].add(week)
             if earliest_activity_ts is None or current_ts < earliest_activity_ts:
                 earliest_activity_ts = current_ts
+            if first_main_commit_ts is None or current_ts < first_main_commit_ts:
+                first_main_commit_ts = current_ts
             for s in SLICES:
                 if in_slice(current_ts, s):
                     if current_sha not in seen_commit or True:
@@ -183,10 +205,9 @@ with open(DATA_DIR / "commits_numstat.tsv") as f:
                     lines_added_per_week[current_author][week] += add
                     file_lines_per_week[current_author][week][path] += add
 
-# Convert sets to counts before serializing
-for s in slices_data:
-    for name in slices_data[s]:
-        slices_data[s][name]["files_touched"] = len(slices_data[s][name]["files_touched"])
+# files_touched stays a set through PR parsing (pre-history augmentation needs
+# to .add() to it). It's converted to a count when contributor records are
+# built (section 10 handles either form).
 
 print(f"Parsed git data: {len(slices_data['all'])} authors all-time, "
       f"{len(slices_data['d30'])} active in last 30d", file=sys.stderr)
@@ -222,15 +243,16 @@ ITERATION_WINDOW_DAYS = int(os.environ.get("ITERATION_WINDOW_DAYS", "30"))
 ITERATION_MIN_SHARED  = int(os.environ.get("ITERATION_MIN_SHARED",  "2"))
 
 # Always load file lists if available — the similarity scan needs them too.
-files_by_pr: dict[int, set] = {}
+# pr_file_nodes retains additions per file for pre-history line recovery.
+files_by_pr:    dict[int, set] = {}
+pr_file_nodes:  dict[int, list] = {}
 try:
     with open(DATA_DIR / "pr_files.jsonl") as f:
         for line in f:
             p = json.loads(line)
-            files_by_pr[p["number"]] = set(
-                n["path"] for n in p.get("files", {}).get("nodes", [])
-                if n.get("path")
-            )
+            nodes = [n for n in p.get("files", {}).get("nodes", []) if n.get("path")]
+            files_by_pr[p["number"]]    = set(n["path"] for n in nodes)
+            pr_file_nodes[p["number"]]  = nodes
 except FileNotFoundError:
     pass
 
@@ -380,6 +402,49 @@ for pr in all_prs:
 
     merged_at  = datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00"))
     created_at = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
+
+    # Pre-history line recovery: PRs merged before this repo's first commit
+    # had their commits squashed into the migration root, losing per-author
+    # line attribution. Credit them via PR data instead.
+    is_prehistory = (
+        INCLUDE_PREHISTORY_PRS
+        and first_main_commit_ts is not None
+        and merged_at < first_main_commit_ts
+    )
+    if is_prehistory:
+        pr_nodes = pr_file_nodes.get(pr["number"], [])
+        pr_total_add = pr.get("additions", 0) or 0
+        pr_total_del = pr.get("deletions", 0) or 0
+        week_of_merge = merged_at.strftime("%Y-W%V")
+        for u, share in shares.items():
+            if u in BOTS:
+                continue
+            display = GH_TO_NAME.get(u, u)
+            attr_add = int(round(pr_total_add * share))
+            attr_del = int(round(pr_total_del * share))
+            for s in SLICES:
+                if not in_slice(merged_at, s):
+                    continue
+                slices_data[s][display]["add"] += attr_add
+                slices_data[s][display]["del"] += attr_del
+            for fnode in pr_nodes:
+                fpath = fnode.get("path")
+                fadd  = fnode.get("additions", 0) or 0
+                if not fpath:
+                    continue
+                attr_fadd = int(round(fadd * share))
+                for s in SLICES:
+                    if in_slice(merged_at, s):
+                        slices_data[s][display]["files_touched"].add(fpath)
+                        if attr_fadd:
+                            per_author_file_add_slice[s][display][fpath] += attr_fadd
+                if attr_fadd:
+                    per_author_file_add[display][fpath] += attr_fadd
+                    per_file_author_add[fpath][display] += attr_fadd
+                    if SHOW_WEEKLY_CHART:
+                        file_lines_per_week[display][week_of_merge][fpath] += attr_fadd
+            if SHOW_WEEKLY_CHART:
+                lines_added_per_week[display][week_of_merge] += attr_add
     ttm_seconds = (merged_at - created_at).total_seconds()
     commits_count = pr.get("commits", {}).get("totalCount", 0)
     was_iterated = pr["number"] in iterated_pr_numbers

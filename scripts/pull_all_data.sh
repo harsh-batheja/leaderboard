@@ -12,9 +12,11 @@ cd "$REPO_DIR"
 mkdir -p "$DATA_DIR"
 
 # 1. Time-stamped commits + numstat. Format:
-#    COMMIT<TAB>sha<TAB>iso-timestamp<TAB>author-name
+#    COMMIT<TAB>sha<TAB>iso-timestamp<TAB>author-name<TAB>parent-shas
 #    add<TAB>del<TAB>path
-git log --no-merges --use-mailmap --pretty=tformat:'COMMIT	%H	%aI	%aN' --numstat \
+# Parent shas (%P) is space-separated; empty when the commit has no parent
+# (i.e. the repo's root commit, used to skip migration squashes).
+git log --no-merges --use-mailmap --pretty=tformat:'COMMIT	%H	%aI	%aN	%P' --numstat \
   > "$DATA_DIR/commits_numstat.tsv"
 
 # 2. Per-file commit count (last 90 days) for hotspot weights
