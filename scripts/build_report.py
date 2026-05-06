@@ -483,7 +483,12 @@ for pr in all_prs:
                 stats["pr_credit_iterated"] += share
 
     if active_slices:
-        pr_credit_log[pr["number"]] = {"shares": dict(shares), "slices": active_slices}
+        pr_credit_log[pr["number"]] = {
+            "shares":           dict(shares),
+            "slices":           active_slices,
+            "is_prehistory":    is_prehistory,
+            "effective_author": pr_author_login,    # after trigger-bot reattribution
+        }
 
     # Reviews
     for review in pr.get("reviews", {}).get("nodes", []):
@@ -569,6 +574,29 @@ def weekly_metric_value(name: str, week: str) -> float:
     if WEEKLY_CHART_METRIC == "reviews":
         return reviews_per_week[name].get(week, 0)
     return 0
+
+# Per-PR per-author weighted-lines contribution. Lets credit deltas shift the
+# headline impact metric in lockstep with PR credit. For non-pre-history PRs
+# we attribute the whole PR's weighted lines to the squash author (where git
+# log actually puts them); for pre-history PRs we use the per-commit-author
+# share (consistent with how lines were credited via PR data above).
+pr_weighted_by_login: dict = defaultdict(dict)
+for pr_num, info in pr_credit_log.items():
+    nodes = pr_file_nodes.get(pr_num, [])
+    pr_total_w = 0.0
+    for n in nodes:
+        path = n.get("path")
+        adds = n.get("additions", 0) or 0
+        if path and adds:
+            pr_total_w += adds * file_weight.get(path, 1.0)
+    if pr_total_w <= 0:
+        continue
+    if info.get("is_prehistory"):
+        for login, share in info["shares"].items():
+            if share > 0:
+                pr_weighted_by_login[pr_num][login] = share * pr_total_w
+    else:
+        pr_weighted_by_login[pr_num][info["effective_author"]] = pr_total_w
 
 # ─── 5. Per-author top files (all-time) ────────────────────────────────────────
 
@@ -716,17 +744,25 @@ if CREDIT_DELTA_ENABLED:
         pr_total_shifted[m_num] += shift_pct
 
         to_login = pair["closed_author"]
+        to_display = GH_TO_NAME.get(to_login, to_login)
         applied  = []
         for from_login, share in log["shares"].items():
             if from_login == to_login or from_login in BOTS:
                 continue
-            amount = share * shift_pct
-            if amount <= 0:
+            amount   = share * shift_pct
+            amount_w = pr_weighted_by_login.get(m_num, {}).get(from_login, 0) * shift_pct
+            from_display = GH_TO_NAME.get(from_login, from_login)
+            if amount <= 0 and amount_w <= 0:
                 continue
             for s in log["slices"]:
                 pr_slices[s][from_login]["pr_credit"] -= amount
                 pr_slices[s][to_login]["pr_credit"] += amount
-            applied.append({"from": from_login, "to": to_login, "amount": round(amount, 3)})
+                if amount_w > 0:
+                    weighted_lines_per_slice[s][from_display] -= amount_w
+                    weighted_lines_per_slice[s][to_display]   += amount_w
+            applied.append({"from": from_login, "to": to_login,
+                            "amount": round(amount, 3),
+                            "weighted": round(amount_w, 1)})
 
         if applied:
             credit_delta_log.append({
@@ -766,17 +802,25 @@ if ITERATION_CREDIT_DELTA:
             if budget <= 0:
                 break
             shift = min(ITERATION_DELTA_PER_FIX, budget)
+            q_display = GH_TO_NAME.get(q_author, q_author)
             applied = []
             for from_login, share in log["shares"].items():
                 if from_login == q_author or from_login in BOTS:
                     continue
-                amount = share * shift
-                if amount <= 0:
+                amount   = share * shift
+                amount_w = pr_weighted_by_login.get(p_num, {}).get(from_login, 0) * shift
+                from_display = GH_TO_NAME.get(from_login, from_login)
+                if amount <= 0 and amount_w <= 0:
                     continue
                 for s in log["slices"]:
                     pr_slices[s][from_login]["pr_credit"] -= amount
                     pr_slices[s][q_author]["pr_credit"]   += amount
-                applied.append({"from": from_login, "to": q_author, "amount": round(amount, 3)})
+                    if amount_w > 0:
+                        weighted_lines_per_slice[s][from_display] -= amount_w
+                        weighted_lines_per_slice[s][q_display]    += amount_w
+                applied.append({"from": from_login, "to": q_author,
+                                "amount": round(amount, 3),
+                                "weighted": round(amount_w, 1)})
             if applied:
                 already += shift
                 iteration_delta_log.append({
