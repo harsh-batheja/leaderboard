@@ -68,12 +68,13 @@ SLICE_BASE = [
     ("d7",   timedelta(days=7),    "Last 7 days"),
 ]
 SLICE_EXTRAS = {
+    "d60":  (timedelta(days=60),   "Last 60 days"),
     "q90":  (timedelta(days=90),   "Last 90 days"),
     "h180": (timedelta(days=180),  "Last 6 months"),
     "y365": (timedelta(days=365),  "Last year"),
 }
-# Insert extras after "all" in length order: y365, h180, q90, then d30, d7
-EXTRAS_IN_ORDER = ["y365", "h180", "q90"]
+# Insert extras after "all" in length order: y365, h180, q90, d60, then d30, d7
+EXTRAS_IN_ORDER = ["y365", "h180", "q90", "d60"]
 slices_ordered = [SLICE_BASE[0]]
 for code in EXTRAS_IN_ORDER:
     if code in EXTRA_SLICES_REQUESTED:
@@ -677,29 +678,28 @@ else:
     print("Iteration credit delta: disabled (set ITERATION_CREDIT_DELTA=1 to enable, requires SHOW_ITERATION=1)",
           file=sys.stderr)
 
-# ─── Streak / active-weeks calendar enumeration ──────────────────────────────
-# Build the calendar (every ISO week) inside each slice once, then look up each
-# author's activity-set against it. Skipped when SHOW_STREAK is off — even the
-# enumeration is wasted otherwise.
+# ─── Calendar enumeration per slice ──────────────────────────────────────────
+# Always computed (used by both the per-slice sparkline and the optional
+# streak/active-weeks columns). Each entry is the ordered list of ISO week
+# strings that fall inside the slice window.
 
 slice_calendar_weeks: dict[str, list[str]] = {}
-if SHOW_STREAK:
-    all_time_start = earliest_activity_ts or NOW
-    for s, delta in SLICES.items():
-        start = (NOW - delta) if delta is not None else all_time_start
-        weeks: list[str] = []
-        seen_w: set[str] = set()
-        cur = start
-        while cur <= NOW:
-            wk = cur.strftime("%Y-W%V")
-            if wk not in seen_w:
-                seen_w.add(wk)
-                weeks.append(wk)
-            cur += timedelta(days=1)
-        slice_calendar_weeks[s] = weeks
-    print(f"Streak calendars: " +
-          ", ".join(f"{s}={len(w)}w" for s, w in slice_calendar_weeks.items()),
-          file=sys.stderr)
+all_time_start = earliest_activity_ts or NOW
+for s, delta in SLICES.items():
+    start = (NOW - delta) if delta is not None else all_time_start
+    weeks: list[str] = []
+    seen_w: set[str] = set()
+    cur = start
+    while cur <= NOW:
+        wk = cur.strftime("%Y-W%V")
+        if wk not in seen_w:
+            seen_w.add(wk)
+            weeks.append(wk)
+        cur += timedelta(days=1)
+    slice_calendar_weeks[s] = weeks
+print(f"Slice calendars: " +
+      ", ".join(f"{s}={len(w)}w" for s, w in slice_calendar_weeks.items()),
+      file=sys.stderr)
 
 def streak_metrics(name: str, slice_name: str) -> dict:
     cal = slice_calendar_weeks.get(slice_name) or []
@@ -759,6 +759,7 @@ for name in all_names:
                 if pd["prs"] > 0 else None
             ),
             "weighted_lines": round(weighted_lines_per_slice[s].get(name, 0)),
+            "sparkline": [commits_per_week[name].get(w, 0) for w in slice_calendar_weeks[s]],
             "add": gd["add"],
             "del": gd["del"],
             "net": gd["add"] - gd["del"],

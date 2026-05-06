@@ -483,7 +483,7 @@ function getRows() {
       files: s.files,
       packages: r.packages,
       top_files: r.top_files,
-      sparkline: r.sparkline,
+      sparkline: (s.sparkline != null) ? s.sparkline : r.sparkline,
     };
   }).filter(r => r.commits || r.add || r.prs || r.reviews);
 }
