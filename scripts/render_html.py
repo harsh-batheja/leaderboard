@@ -145,9 +145,46 @@ HTML = r"""<!doctype html>
                          font-size: 11px; color: var(--muted); }
   .weekly-chart-legend i { display: inline-block; width: 9px; height: 9px;
                            border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+
+  /* Per-contributor detail view */
+  .detail-back { color: var(--muted); text-decoration: none; font-size: 13px;
+                 display: inline-block; margin-bottom: 16px; }
+  .detail-back:hover { color: var(--accent); }
+  .detail-header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+                   padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+  .detail-name { font-size: 28px; font-weight: 600; }
+  .detail-login { color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
+  .detail-gh { margin-left: auto; font-size: 13px; }
+  .detail-tickers { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                    gap: 12px; margin: 18px 0; }
+  .ticker { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+            padding: 14px 16px; }
+  .ticker-label { font-size: 10.5px; color: var(--muted); text-transform: uppercase;
+                  letter-spacing: 0.05em; }
+  .ticker-value { font-size: 22px; font-weight: 600; color: var(--text);
+                  font-variant-numeric: tabular-nums; }
+  .ticker-delta { font-size: 11px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .ticker-delta.up { color: var(--c-added); }
+  .ticker-delta.down { color: var(--c-deleted); }
+  .ticker-delta.flat { color: var(--muted); }
+  .detail-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; margin: 18px 0; }
+  .detail-card { background: var(--panel); border: 1px solid var(--border);
+                 border-radius: 8px; padding: 16px 18px; }
+  .detail-card h3 { font-size: 12px; color: var(--muted); text-transform: uppercase;
+                    letter-spacing: 0.05em; margin: 0 0 10px; }
+  .detail-slice-table { width: 100%; font-size: 12px; }
+  .detail-slice-table th { text-align: right; padding: 4px 8px; color: var(--muted);
+                            font-weight: 500; }
+  .detail-slice-table th:first-child { text-align: left; }
+  .detail-slice-table td { text-align: right; padding: 4px 8px;
+                            font-variant-numeric: tabular-nums; }
+  .detail-slice-table td:first-child { text-align: left; color: var(--muted); }
 </style>
 </head>
 <body>
+
+<div id="detailView" style="display:none;"></div>
+<div id="mainView">
 
 <h1>__PAGE_TITLE__</h1>
 <div class="subtitle">
@@ -403,6 +440,8 @@ HTML = r"""<!doctype html>
   <div>Data sources: <code>git log --use-mailmap</code>, <code>gh api graphql</code> (PRs + reviews).</div>
 </footer>
 
+</div><!-- /#mainView -->
+
 <script>
 const DATA = __DATA_JSON__;
 
@@ -589,9 +628,10 @@ function renderTable() {
   body.innerHTML = "";
   rows.forEach(r => {
     const tr = document.createElement("tr");
-    const ghLink = r.ghLogin && r.ghLogin !== r.name
-      ? `<a href="https://github.com/${escape(r.ghLogin)}" target="_blank" rel="noopener">${escape(r.name)}</a>`
+    const detailLink = r.ghLogin
+      ? `<a href="#/c/${encodeURIComponent(r.ghLogin)}">${escape(r.name)}</a>`
       : escape(r.name);
+    const ghLink = detailLink;  // legacy alias
     const netClass = r.net >= 0 ? "bar-net-pos" : "bar-net-neg";
     const iterCell = (r.iteration_rate == null)
       ? `<span class="muted-num">—</span>`
@@ -962,6 +1002,180 @@ $$("#leaderboard th[data-sort]").forEach(th => {
   });
 });
 
+// Per-contributor detail view (stock-market style). Hash-routed:
+// #/c/<gh_login> shows the detail panel; anything else shows the leaderboard.
+const METRIC_LABELS_DETAIL = METRIC_LABELS;
+
+function findContributor(login) {
+  for (const [name, r] of Object.entries(DATA.contributors)) {
+    if (r.ghLogin === login || name === login) return [name, r];
+  }
+  return null;
+}
+
+function renderTimeSeriesChart(values, weekLabels, color) {
+  if (!values.length) return "";
+  const W = 980, H = 220, padL = 50, padR = 12, padT = 12, padB = 24;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const maxY = Math.max(...values, 1);
+  const colW = innerW / values.length;
+  const barW = Math.max(2, colW * 0.78);
+  const bars = values.map((v, i) => {
+    if (!v) return "";
+    const h = (v / maxY) * innerH;
+    const x = padL + i * colW + (colW - barW) / 2;
+    const y = padT + innerH - h;
+    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${color}" opacity="0.9"><title>${escape(weekLabels[i] || "")} · ${v}</title></rect>`;
+  }).join("");
+  const ticks = [];
+  for (let t = 0; t <= 4; t++) {
+    const v = maxY * t / 4;
+    const y = padT + innerH - (v / maxY) * innerH;
+    ticks.push(`<line x1="${padL}" x2="${padL+innerW}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2,3"/>` +
+               `<text x="${padL-6}" y="${(y+3).toFixed(1)}" font-size="10" fill="var(--muted)" text-anchor="end">${v >= 1000 ? (v/1000).toFixed(1)+"k" : Math.round(v)}</text>`);
+  }
+  const labelEvery = values.length > 26 ? 4 : values.length > 13 ? 2 : 1;
+  const xLabels = weekLabels.map((wk, i) => {
+    if (i % labelEvery !== 0 && i !== weekLabels.length - 1) return "";
+    const x = padL + i * colW + colW / 2;
+    return `<text x="${x.toFixed(1)}" y="${(H - 6).toFixed(1)}" font-size="10" fill="var(--muted)" text-anchor="middle">${escape((wk||"").replace("2026-",""))}</text>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;width:100%;">${ticks.join("")}${bars}${xLabels}</svg>`;
+}
+
+function deltaPct(curr, prev) {
+  if (!prev) return null;
+  return ((curr - prev) / prev) * 100;
+}
+
+function renderDetail(login) {
+  const found = findContributor(login);
+  const view = document.getElementById("detailView");
+  const main = document.getElementById("mainView");
+  if (!found) {
+    main.style.display = "";
+    view.style.display = "none";
+    return;
+  }
+  const [name, r] = found;
+  main.style.display = "none";
+  view.style.display = "";
+
+  const all = r.slices.all || {};
+  const d30 = r.slices.d30 || {};
+  const d60 = r.slices.d60 || d30;
+  // Period-over-period deltas: last 30 vs the 30 before that.
+  const prev30 = {
+    weighted_lines: Math.max(0, (d60.weighted_lines || 0) - (d30.weighted_lines || 0)),
+    prs:            Math.max(0, (d60.prs || 0) - (d30.prs || 0)),
+    commits:        Math.max(0, (d60.commits || 0) - (d30.commits || 0)),
+    reviews:        Math.max(0, (d60.reviews || 0) - (d30.reviews || 0)),
+  };
+
+  function tickerHtml(label, value, deltaP) {
+    let deltaStr = "—", cls = "flat";
+    if (deltaP != null && isFinite(deltaP)) {
+      cls = deltaP > 1 ? "up" : deltaP < -1 ? "down" : "flat";
+      deltaStr = `${deltaP >= 0 ? "+" : ""}${deltaP.toFixed(1)}% vs prior 30d`;
+    }
+    return `<div class="ticker"><div class="ticker-label">${escape(label)}</div>
+              <div class="ticker-value">${value}</div>
+              <div class="ticker-delta ${cls}">${escape(deltaStr)}</div></div>`;
+  }
+
+  const slicesToShow = (DATA.slices || []).map(s => s.code);
+  const sliceCols = (col) => slicesToShow.map(s => {
+    const v = (r.slices[s] || {})[col];
+    return `<td>${v == null ? "—" : (typeof v === "number" ? fmt(Math.round(v*10)/10) : escape(String(v)))}</td>`;
+  }).join("");
+  const sliceHeader = slicesToShow.map(s => {
+    const meta = (DATA.slices || []).find(x => x.code === s);
+    return `<th>${escape((meta && meta.label) || s)}</th>`;
+  }).join("");
+
+  // Time-series chart of headline metric (weighted_lines per week — full history).
+  const chartValues = (all.weekly_metric || all.sparkline || []);
+  const chartWeeks = (DATA.slice_calendar_weeks && DATA.slice_calendar_weeks.all) || DATA.weeks || [];
+
+  const topFiles = (r.top_files || []).map(([p, n]) =>
+    `<tr><td style="font-family:ui-monospace,Menlo,monospace;font-size:11px;">${escape(p)}</td><td class="num">${fmt(n)}</td></tr>`
+  ).join("") || "<tr><td>(none)</td><td></td></tr>";
+
+  const pkgEntries = Object.entries(r.packages || {}).sort((a,b) => b[1] - a[1]);
+  const pkgTotal = pkgEntries.reduce((s,[_,v]) => s+v, 0) || 1;
+  const pkgBar = pkgEntries.map(([p, v]) =>
+    `<div title="${escape(p)}: ${fmt(v)}" style="width:${(v/pkgTotal*100).toFixed(2)}%;background:${pkgColor(p)};"></div>`
+  ).join("");
+  const pkgList = pkgEntries.slice(0, 8).map(([p, v]) =>
+    `<div class="detail-row"><span class="label">${escape(p)}</span><span class="value">${fmt(v)}</span></div>`
+  ).join("");
+
+  view.innerHTML = `
+    <a class="detail-back" href="#/">← Back to leaderboard</a>
+    <div class="detail-header">
+      <div class="detail-name">${escape(name)}</div>
+      <div class="detail-login">${r.ghLogin && r.ghLogin !== name ? "(@"+escape(r.ghLogin)+")" : ""}</div>
+      ${r.ghLogin ? `<div class="detail-gh"><a href="https://github.com/${escape(r.ghLogin)}" target="_blank" rel="noopener">View on GitHub →</a></div>` : ""}
+    </div>
+
+    <div class="detail-tickers">
+      ${tickerHtml("Weighted lines", fmt(all.weighted_lines || 0), deltaPct(d30.weighted_lines || 0, prev30.weighted_lines))}
+      ${tickerHtml("PRs (credit)", fmt(all.prs || 0), deltaPct(d30.prs || 0, prev30.prs))}
+      ${tickerHtml("Commits", fmt(all.commits || 0), deltaPct(d30.commits || 0, prev30.commits))}
+      ${tickerHtml("Reviews", fmt(all.reviews || 0), deltaPct(d30.reviews || 0, prev30.reviews))}
+      ${tickerHtml("Files touched", fmt(all.files || 0), null)}
+      ${all.streak_longest != null ? tickerHtml("Streak", `${all.streak_longest}w`, null) : ""}
+    </div>
+
+    <div class="detail-card" style="margin-bottom:16px;">
+      <h3>${escape(METRIC_LABELS_DETAIL[DATA.weekly_chart_metric] || "Weekly contribution")} — full history</h3>
+      ${chartValues.length ? renderTimeSeriesChart(chartValues, chartWeeks, "#79c0ff") : '<div class="muted-num" style="font-size:12px;">No weekly data.</div>'}
+    </div>
+
+    <div class="detail-card" style="margin-bottom:16px;">
+      <h3>By time slice</h3>
+      <table class="detail-slice-table">
+        <thead><tr><th></th>${sliceHeader}</tr></thead>
+        <tbody>
+          <tr><td>W. Lines</td>${sliceCols("weighted_lines")}</tr>
+          <tr><td>Commits</td>${sliceCols("commits")}</tr>
+          <tr><td>Lines+</td>${sliceCols("add")}</tr>
+          <tr><td>Lines−</td>${sliceCols("del")}</tr>
+          <tr><td>PRs (credit)</td>${sliceCols("prs")}</tr>
+          <tr><td>Reviews</td>${sliceCols("reviews")}</tr>
+          <tr><td>Files</td>${sliceCols("files")}</tr>
+          ${DATA.show_iteration ? `<tr><td>Iteration</td>${slicesToShow.map(s => { const v = (r.slices[s]||{}).iteration_rate; return `<td>${v==null?"—":v+"%"}</td>`; }).join("")}</tr>` : ""}
+          ${DATA.show_streak ? `<tr><td>Streak</td>${slicesToShow.map(s => { const v = (r.slices[s]||{}).streak_longest; const cur = (r.slices[s]||{}).streak_current; return `<td>${v==null?"—":(v+"w"+(cur?` · ${cur} now`:""))}</td>`; }).join("")}</tr>` : ""}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="detail-grid">
+      <div class="detail-card">
+        <h3>Top files</h3>
+        <table style="width:100%;font-size:12px;">${topFiles}</table>
+      </div>
+      <div class="detail-card">
+        <h3>Packages</h3>
+        <div class="pkg-bar" style="margin-bottom:8px;">${pkgBar}</div>
+        ${pkgList}
+      </div>
+    </div>
+  `;
+  window.scrollTo(0, 0);
+}
+
+function route() {
+  const m = window.location.hash.match(/^#\/c\/(.+)$/);
+  if (m) {
+    renderDetail(decodeURIComponent(m[1]));
+  } else {
+    document.getElementById("mainView").style.display = "";
+    document.getElementById("detailView").style.display = "none";
+  }
+}
+window.addEventListener("hashchange", route);
+
 renderStats();
 renderTable();
 renderPackageTable();
@@ -969,6 +1183,7 @@ renderStandouts();
 renderHotspots();
 renderSimilarity();
 renderWeeklyChart();
+route();   // route after main render so the back-button arrives at a populated view
 </script>
 </body>
 </html>
